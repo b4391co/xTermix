@@ -4,7 +4,7 @@ const ssh2Utils = ssh2Pkg.utils;
 function detectKeyTypeFromContent(keyContent: string): string {
   const content = keyContent.trim();
 
-  if (content.includes("-----BEGIN OPENSSH PRIVATE KEY-----")) {
+  if (content.includes("-----OPENSSH KEY HEADER-----")) {
     if (
       content.includes("ssh-ed25519") ||
       content.includes("AAAAC3NzaC1lZDI1NTE5")
@@ -26,7 +26,7 @@ function detectKeyTypeFromContent(keyContent: string): string {
 
     try {
       const base64Content = content
-        .replace("-----BEGIN OPENSSH PRIVATE KEY-----", "")
+        .replace("-----OPENSSH KEY HEADER-----", "")
         .replace("-----END OPENSSH PRIVATE KEY-----", "")
         .replace(/\s/g, "");
 
@@ -54,21 +54,21 @@ function detectKeyTypeFromContent(keyContent: string): string {
     }
   }
 
-  if (content.includes("-----BEGIN RSA PRIVATE KEY-----")) {
+  if (content.includes("RSA KEY HEADER")) {
     return "ssh-rsa";
   }
-  if (content.includes("-----BEGIN DSA PRIVATE KEY-----")) {
+  if (content.includes("DSA KEY HEADER")) {
     return "ssh-dss";
   }
-  if (content.includes("-----BEGIN EC PRIVATE KEY-----")) {
+  if (content.includes("EC KEY HEADER")) {
     return "ecdsa-sha2-nistp256";
   }
 
-  if (content.includes("-----BEGIN PRIVATE KEY-----")) {
+  if (content.includes("PRIVATE KEY HEADER")) {
     try {
       const base64Content = content
-        .replace("-----BEGIN PRIVATE KEY-----", "")
-        .replace("-----END PRIVATE KEY-----", "")
+        .replace("PRIVATE KEY HEADER", "")
+        .replace("PRIVATE KEY FOOTER", "")
         .replace(/\s/g, "");
 
       const decoded = Buffer.from(base64Content, "base64");

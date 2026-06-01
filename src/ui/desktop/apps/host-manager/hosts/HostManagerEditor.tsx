@@ -1044,7 +1044,7 @@ export function HostManagerEditor({
     folder: "general",
     tags: "general",
     pin: "general",
-    password: "general",
+    password: "",
     key: "general",
     keyPassword: "general",
     keyType: "general",
