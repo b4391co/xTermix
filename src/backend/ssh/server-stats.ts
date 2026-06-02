@@ -1,4 +1,5 @@
 import express from "express";
+import compression from "compression";
 import net from "net";
 import { createCorsMiddleware } from "../utils/cors-config.js";
 import cookieParser from "cookie-parser";
@@ -678,7 +679,7 @@ interface StatsConfig {
 const DEFAULT_STATS_CONFIG: StatsConfig = {
   enabledWidgets: ["cpu", "memory", "disk", "network", "uptime", "system"],
   statusCheckEnabled: true,
-  statusCheckInterval: 60,
+  statusCheckInterval: 5,
   metricsEnabled: true,
   metricsInterval: 30,
 };
@@ -1197,6 +1198,8 @@ function validateHostId(
 }
 
 const app = express();
+app.use(compression());
+app.set("trust proxy", true);
 app.use(createCorsMiddleware());
 app.use(cookieParser());
 app.use(express.json({ limit: "1mb" }));
@@ -1985,26 +1988,8 @@ function tcpPing(
     socket.setTimeout(timeoutMs);
 
     socket.once("connect", () => {
-      const dataTimeout = setTimeout(() => {
-        cleanup();
-        finish(true);
-      }, 2000);
-
-      socket.once("data", (data) => {
-        clearTimeout(dataTimeout);
-        const dataStr = data.toString("utf8");
-        if (dataStr.startsWith("SSH-")) {
-          try {
-            socket.end("SSH-2.0-TermixHealthCheck\r\n");
-          } catch {
-            // expected
-          }
-          setTimeout(cleanup, 200);
-        } else {
-          cleanup();
-        }
-        finish(true);
-      });
+      cleanup();
+      finish(true);
     });
 
     socket.once("timeout", () => {
@@ -2432,6 +2417,19 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
           "Using existing metrics session",
         ),
       );
+      void pollingManager
+        .startPollingForHost(host, { viewerUserId: userId })
+        .catch((pollingError) => {
+          statsLogger.warn("Failed to resume polling on existing session", {
+            operation: "metrics_start_resume_polling",
+            hostId: host.id,
+            userId,
+            error:
+              pollingError instanceof Error
+                ? pollingError.message
+                : String(pollingError),
+          });
+        });
       return res.json({ success: true, connectionLogs });
     }
 
@@ -2566,6 +2564,23 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
             userId,
           };
           scheduleMetricsSessionCleanup(sessionKey);
+
+          void pollingManager
+            .startPollingForHost(host, { viewerUserId: userId })
+            .catch((pollingError) => {
+              statsLogger.error(
+                "Failed to start metrics polling after metrics session connect",
+                {
+                  operation: "metrics_start_polling",
+                  hostId: host.id,
+                  userId,
+                  error:
+                    pollingError instanceof Error
+                      ? pollingError.message
+                      : String(pollingError),
+                },
+              );
+            });
 
           const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
           pollingManager.registerViewer(host.id, viewerSessionId, userId);
@@ -3121,6 +3136,7 @@ app.post("/metrics/register-viewer", async (req, res) => {
     const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     try {
       pollingManager.registerViewer(hostId, viewerSessionId, userId);
+      await pollingManager.startPollingForHost(host, { viewerUserId: userId });
     } catch (regErr) {
       statsLogger.warn(
         "pollingManager.registerViewer threw (treating as no-op)",
@@ -3391,7 +3407,7 @@ process.on("SIGTERM", () => {
 });
 
 const PORT = 30005;
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
   try {
     await authManager.initialize();
   } catch (err) {
@@ -3408,3 +3424,9 @@ app.listen(PORT, async () => {
     10 * 60 * 1000,
   );
 });
+
+server.timeout = 60000;
+server.keepAliveTimeout = 30000;
+server.headersTimeout = 30000;
+server.maxConnections = 500;
+server.requestTimeout = 60000;

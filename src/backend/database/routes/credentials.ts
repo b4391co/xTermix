@@ -1535,7 +1535,7 @@ router.post(
 
       if (
         !privateKeyObj &&
-        privateKey.includes("RSA KEY HEADER")
+        privateKey.includes("-----BEGIN RSA PRIVATE KEY-----")
       ) {
         try {
           privateKeyObj = crypto.createPrivateKey({
@@ -1550,7 +1550,7 @@ router.post(
 
       if (
         !privateKeyObj &&
-        privateKey.includes("EC KEY HEADER")
+        privateKey.includes("-----BEGIN EC PRIVATE KEY-----")
       ) {
         try {
           privateKeyObj = crypto.createPrivateKey({

@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import { useTranslation } from "react-i18next";
 import type { TabContextTab, TerminalRefHandle } from "../../../types/index.js";
+import { toast } from "sonner";
 
 export type Tab = TabContextTab;
 export type SplitDirection = "horizontal" | "vertical";
@@ -96,7 +97,7 @@ function buildPersistentShellCommand(sessionId: string): string {
     /[^a-zA-Z0-9_-]/g,
     "_",
   );
-  return `if command -v tmux >/dev/null 2>&1; then tmux new-session -Ad -s "${safeSession}"; tmux set-option -t "${safeSession}" -g mouse on; tmux set-option -t "${safeSession}" -g xterm-keys on 2>/dev/null || true; tmux set-option -t "${safeSession}" -g extended-keys on 2>/dev/null || true; tmux set-option -t "${safeSession}" -as terminal-features "xterm-256color:extkeys" 2>/dev/null || true; tmux attach-session -t "${safeSession}"; elif command -v screen >/dev/null 2>&1; then screen -xRR "${safeSession}"; else echo "[Termix] tmux/screen no disponible; esta terminal no sera persistente al recargar."; fi`;
+  return `if command -v tmux >/dev/null 2>&1; then tmux new-session -Ad -s "${safeSession}" 2>/dev/null && { tmux set-option -t "${safeSession}" -g mouse on; tmux set-option -t "${safeSession}" -g set-clipboard off; tmux set-option -t "${safeSession}" -g xterm-keys on 2>/dev/null || true; tmux set-option -t "${safeSession}" -g extended-keys on 2>/dev/null || true; tmux set-option -t "${safeSession}" -as terminal-features "xterm-256color:extkeys" 2>/dev/null || true; tmux attach-session -t "${safeSession}"; } || tmux attach-session -t "${safeSession}" 2>/dev/null || true; elif command -v screen >/dev/null 2>&1; then screen -xRR "${safeSession}" 2>/dev/null || screen -R "${safeSession}"; else echo "[Termix] tmux/screen no disponible; esta terminal no sera persistente al recargar."; for shell in bash sh /bin/bash /usr/bin/bash /bin/sh /usr/bin/sh /bin/ash /bin/dash /bin/busybox; do if command -v "\$shell" >/dev/null 2>&1; then exec "\$shell"; fi; done; fi`;
 }
 
 interface TabContextType {
@@ -111,6 +112,7 @@ interface TabContextType {
   addTab: (tab: Omit<Tab, "id">) => number;
   removeTab: (tabId: number) => void;
   closeTabGroup: (tabId: number) => void;
+  togglePinTab: (tabId: number) => void;
   setCurrentTab: (tabId: number) => void;
   setSplitScreenTab: (tabId: number) => void;
   splitFocusedPane: (direction: SplitDirection) => void;
@@ -124,7 +126,11 @@ interface TabContextType {
   getSessionRootForTab: (tabId: number) => number;
   resolveSplitPickerToTerminal: (
     pickerTabId: number,
-    payload: { title: string; hostConfig: any },
+    payload: {
+      title: string;
+      hostConfig: any;
+      appType?: "terminal" | "file_manager" | "server_stats" | "rdp" | "vnc" | "telnet";
+    },
   ) => void;
   cancelSplitPicker: (pickerTabId: number) => void;
   getTab: (tabId: number) => Tab | undefined;
@@ -376,6 +382,7 @@ export function TabProvider({ children }: TabProviderProps) {
     const newTab: Tab = {
       ...tabData,
       id,
+      isPinned: Boolean(tabData.isPinned),
       instanceId,
       title: effectiveTitle,
       persistentSessionId,
@@ -427,6 +434,10 @@ export function TabProvider({ children }: TabProviderProps) {
 
   const removeTab = (tabId: number) => {
     const tab = tabs.find((t) => t.id === tabId);
+    if (tab?.isPinned) {
+      toast.info("Desbloquea la pestaña antes de cerrarla.");
+      return;
+    }
     if (tab?.terminalRef?.current?.disconnect) {
       tab.terminalRef.current.disconnect();
     }
@@ -454,6 +465,8 @@ export function TabProvider({ children }: TabProviderProps) {
   };
 
   const closeTabGroup = (tabId: number) => {
+    const target = tabs.find((tab) => tab.id === tabId);
+
     const layoutInfo = getLayoutForTab(tabId);
     if (!layoutInfo) {
       removeTab(tabId);
@@ -461,6 +474,14 @@ export function TabProvider({ children }: TabProviderProps) {
     }
 
     const idsToRemove = new Set(layoutInfo.leafIds);
+    const hasPinnedLeaf = idsToRemove.has(tabId)
+      ? Boolean(target?.isPinned)
+      : layoutInfo.leafIds.some((id) => tabs.find((tab) => tab.id === id)?.isPinned);
+    if (hasPinnedLeaf) {
+      toast.info("Desbloquea la pestaña antes de cerrarla.");
+      return;
+    }
+
     tabs.forEach((tab) => {
       if (idsToRemove.has(tab.id) && tab?.terminalRef?.current?.disconnect) {
         tab.terminalRef.current.disconnect();
@@ -499,6 +520,16 @@ export function TabProvider({ children }: TabProviderProps) {
       const remaining = tabs.filter((t) => !idsToRemove.has(t.id));
       setCurrentTabState(remaining.length > 0 ? remaining[0].id : 1);
     }
+  };
+
+  const togglePinTab = (tabId: number) => {
+    setTabs((prev) =>
+      prev.map((tab) =>
+        tab.id === tabId && tab.type !== "home"
+          ? { ...tab, isPinned: !Boolean(tab.isPinned) }
+          : tab,
+      ),
+    );
   };
 
   const setSplitScreenTab = (tabId: number) => {
@@ -736,17 +767,34 @@ export function TabProvider({ children }: TabProviderProps) {
 
   const resolveSplitPickerToTerminal = (
     pickerTabId: number,
-    payload: { title: string; hostConfig: any },
+    payload: {
+      title: string;
+      hostConfig: any;
+      appType?:
+        | "terminal"
+        | "file_manager"
+        | "server_stats"
+        | "rdp"
+        | "vnc"
+        | "telnet";
+    },
   ) => {
     const connectionType = payload.hostConfig?.connectionType || "ssh";
-    const tabType =
-      connectionType === "rdp" ||
-      connectionType === "vnc" ||
-      connectionType === "telnet"
+    const requestedAppType = payload.appType;
+    const tabType = requestedAppType
+      ? requestedAppType
+      : connectionType === "rdp" ||
+          connectionType === "vnc" ||
+          connectionType === "telnet"
         ? (connectionType as "rdp" | "vnc" | "telnet")
         : "terminal";
-    const persistentSessionId = `termix_${pickerTabId}`;
-    const newInstanceId = `tab_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const shouldBeTerminal = tabType === "terminal";
+    const newInstanceId = `tab_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2, 9)}`;
+    const persistentSessionId = shouldBeTerminal
+      ? `termix_${pickerTabId}`
+      : undefined;
 
     setTabs((prev) =>
       prev.map((tab) =>
@@ -762,13 +810,13 @@ export function TabProvider({ children }: TabProviderProps) {
                     instanceId: tab.instanceId || newInstanceId,
                   }
                 : payload.hostConfig,
-              terminalRef:
-                tabType === "terminal" ? React.createRef<any>() : undefined,
+              terminalRef: shouldBeTerminal
+                ? React.createRef<any>()
+                : undefined,
               persistentSessionId,
-              executeCommand:
-                tabType === "terminal"
-                  ? buildPersistentShellCommand(persistentSessionId)
-                  : undefined,
+              executeCommand: shouldBeTerminal
+                ? buildPersistentShellCommand(persistentSessionId || "")
+                : undefined,
             }
           : tab,
       ),
@@ -878,6 +926,7 @@ export function TabProvider({ children }: TabProviderProps) {
           const persistentSessionId = tab.persistentSessionId || `termix_${tab.id}`;
           return {
             ...tab,
+            isPinned: Boolean(tab.isPinned),
             instanceId,
             hostConfig: normalizedHostConfig,
             persistentSessionId,
@@ -887,6 +936,7 @@ export function TabProvider({ children }: TabProviderProps) {
         }
         return {
           ...tab,
+          isPinned: Boolean(tab.isPinned),
           instanceId,
           hostConfig: normalizedHostConfig,
           terminalRef: undefined,
@@ -949,6 +999,7 @@ export function TabProvider({ children }: TabProviderProps) {
         id: tab.id,
         type: tab.type,
         title: tab.title,
+        isPinned: tab.isPinned,
         hostConfig: tab.hostConfig,
         instanceId: tab.instanceId,
         connectionConfig: tab.connectionConfig,
@@ -1059,6 +1110,7 @@ export function TabProvider({ children }: TabProviderProps) {
       addTab,
       removeTab,
       closeTabGroup,
+      togglePinTab,
       setCurrentTab,
       setSplitScreenTab,
       splitFocusedPane,

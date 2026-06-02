@@ -139,6 +139,7 @@ export default defineConfig({
     headers: {
       "Cache-Control":
         "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
+      "Content-Security-Policy": "upgrade-insecure-requests",
       Pragma: "no-cache",
       Expires: "0",
     },

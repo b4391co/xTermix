@@ -761,14 +761,14 @@ router.get("/oidc-config/admin", requireAdmin, async (req, res) => {
             adminDataKey,
           );
         } else {
-          config.client_secret = "[ENCRYPTED]";
+          config.client_secret = "[ENCRYPTED - PASSWORD REQUIRED]";
         }
       } catch {
         authLogger.warn("Failed to decrypt OIDC config for admin", {
           operation: "oidc_config_decrypt_failed",
           userId,
         });
-        config.client_secret = "[ENCRYPTED]";
+        config.client_secret = "[ENCRYPTED - DECRYPTION FAILED]";
       }
     } else if (config.client_secret?.startsWith("encoded:")) {
       try {

@@ -574,7 +574,7 @@ function handleOPKSSHOutput(requestId: string, output: string): void {
     session.callbackPort = parseInt(callbackPortMatch[1], 10);
   }
 
-  if (output.includes("OPENSSH KEY HEADER")) {
+  if (output.includes("BEGIN OPENSSH PRIVATE KEY")) {
     session.status = "authenticating";
     session.ws.send(
       JSON.stringify({
@@ -587,7 +587,7 @@ function handleOPKSSHOutput(requestId: string, output: string): void {
   }
 
   const privateKeyMatch = session.stdoutBuffer.match(
-    /(-----OPENSSH KEY HEADER-----[\s\S]*?-----END OPENSSH PRIVATE KEY-----)/,
+    /(-----BEGIN OPENSSH PRIVATE KEY-----[\s\S]*?-----END OPENSSH PRIVATE KEY-----)/,
   );
   if (privateKeyMatch) {
     session.privateKeyBuffer = privateKeyMatch[1].trim();
@@ -613,7 +613,7 @@ function handleOPKSSHOutput(requestId: string, output: string): void {
   }
 
   if (session.privateKeyBuffer && session.sshCertBuffer) {
-    if (!session.privateKeyBuffer.includes("OPENSSH KEY HEADER")) {
+    if (!session.privateKeyBuffer.includes("BEGIN OPENSSH PRIVATE KEY")) {
       sshLogger.error(`Invalid private key extracted [${requestId}]`, {
         bufferPrefix: session.privateKeyBuffer.substring(0, 50),
       });

@@ -400,9 +400,9 @@ export function AppView({
 	        : 50;
 
 	    return (
-	      <ResizablePanelGroup
-	        key={`split:${path}:${node.direction}`}
-	        direction={toPanelDirection(node.direction) as any}
+      <ResizablePanelGroup
+        key={`split:${path}:${node.direction}`}
+        orientation={toPanelDirection(node.direction)}
 	        className="h-full w-full"
 	        onLayout={(sizes: number[]) => {
 	          if (typeof updateSplitPanelSizes === "function") {
