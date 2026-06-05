@@ -106,9 +106,6 @@ class PermissionManager {
 
       const allPermissions = new Set<string>();
       for (const record of userRoleRecords) {
-        if (!record.permissions) {
-          continue;
-        }
         try {
           const permissions = JSON.parse(record.permissions) as string[];
           for (const perm of permissions) {
@@ -141,10 +138,6 @@ class PermissionManager {
   }
 
   async hasPermission(userId: string, permission: string): Promise<boolean> {
-    if (await this.isAdmin(userId)) {
-      return true;
-    }
-
     const userPermissions = await this.getUserPermissions(userId);
 
     if (userPermissions.includes("*")) {
@@ -302,11 +295,7 @@ class PermissionManager {
         .where(
           and(
             eq(userRoles.userId, userId),
-            or(
-              eq(roles.name, "admin"),
-              eq(roles.name, "admins"),
-              eq(roles.name, "super_admin"),
-            ),
+            or(eq(roles.name, "admin"), eq(roles.name, "super_admin")),
           ),
         );
 

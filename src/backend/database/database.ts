@@ -1,5 +1,6 @@
 import express from "express";
 import http from "http";
+import { Readable } from "stream";
 import bodyParser from "body-parser";
 import multer from "multer";
 import cookieParser from "cookie-parser";
@@ -13,6 +14,8 @@ import terminalRoutes from "./routes/terminal.js";
 import guacamoleRoutes from "../guacamole/routes.js";
 import networkTopologyRoutes from "./routes/network-topology.js";
 import rbacRoutes from "./routes/rbac.js";
+import openTabsRoutes from "./routes/open-tabs.js";
+import userPreferencesRoutes from "./routes/user-preferences.js";
 import { createCorsMiddleware } from "../utils/cors-config.js";
 import fs from "fs";
 import path from "path";
@@ -61,9 +64,11 @@ const authenticateJWT = authManager.createAuthMiddleware();
 const requireAdmin = authManager.createAdminMiddleware();
 app.use(createCorsMiddleware());
 
+const uploadsDir = path.join(process.env.DATA_DIR || "./db/data", "uploads");
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, "uploads/");
+    cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
     const timestamp = Date.now();
@@ -204,8 +209,6 @@ app.use(bodyParser.raw({ limit: "5gb", type: "application/octet-stream" }));
 app.use(cookieParser());
 app.use((_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
   next();
 });
 
@@ -1251,6 +1254,7 @@ app.post(
       };
 
       try {
+        mainDb.$client.exec("PRAGMA foreign_keys = OFF");
         try {
           const importedHosts = importDb
             .prepare("SELECT * FROM ssh_data")
@@ -1561,6 +1565,7 @@ app.post(
           );
         }
 
+        mainDb.$client.exec("PRAGMA foreign_keys = ON");
         result.success = true;
 
         try {
@@ -1752,8 +1757,6 @@ app.post("/database/restore", requireAdmin, async (req, res) => {
 
 app.use("/users", userRoutes);
 app.use("/host", hostRoutes);
-app.use("/ssh", hostRoutes);
-app.use("/", hostRoutes);
 app.use("/alerts", alertRoutes);
 app.use("/credentials", credentialsRoutes);
 app.use("/snippets", snippetsRoutes);
@@ -1762,6 +1765,67 @@ app.use("/terminal", terminalRoutes);
 app.use("/guacamole", guacamoleRoutes);
 app.use("/network-topology", networkTopologyRoutes);
 app.use("/rbac", rbacRoutes);
+app.use("/open-tabs", openTabsRoutes);
+app.use("/user-preferences", userPreferencesRoutes);
+
+async function proxyApiRequest(
+  req: express.Request,
+  res: express.Response,
+  targetPort: number,
+  logOperation: string,
+) {
+  try {
+    const targetPath = req.originalUrl.replace(/^\/api/, "");
+    const targetUrl = `http://127.0.0.1:${targetPort}${targetPath}`;
+    const headers: Record<string, string> = {};
+
+    for (const name of ["authorization", "cookie", "content-type", "accept"]) {
+      const value = req.headers[name];
+      if (typeof value === "string") headers[name] = value;
+    }
+
+    const hasBody = !["GET", "HEAD"].includes(req.method.toUpperCase());
+    const upstream = await fetch(targetUrl, {
+      method: req.method,
+      headers,
+      body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+    });
+
+    res.status(upstream.status);
+    upstream.headers.forEach((value, key) => {
+      if (!["content-encoding", "transfer-encoding", "connection"].includes(key.toLowerCase())) {
+        res.setHeader(key, value);
+      }
+    });
+
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    Readable.fromWeb(upstream.body as unknown as import("stream/web").ReadableStream).pipe(res);
+  } catch (error) {
+    apiLogger.error("Failed to proxy /api request", error, {
+      operation: logOperation,
+      method: req.method,
+      url: req.originalUrl,
+      targetPort,
+    });
+    res.status(502).json({ error: "API proxy failed" });
+  }
+}
+
+// Compatibility shims for reverse proxies that route /api/* only to the main
+// API service (30001). These feature services listen on separate local ports.
+app.use("/api/ssh", (req, res) =>
+  proxyApiRequest(req, res, 30003, "api_ssh_proxy_failed"),
+);
+app.use(["/api/status", "/api/metrics", "/api/clear-connections", "/api/refresh", "/api/host-updated", "/api/host-deleted", "/api/global-settings"], (req, res) =>
+  proxyApiRequest(req, res, 30005, "api_stats_proxy_failed"),
+);
+app.use(["/api/uptime", "/api/activity", "/api/dashboard"], (req, res) =>
+  proxyApiRequest(req, res, 30006, "api_dashboard_proxy_failed"),
+);
 
 const frontendDistPaths = [
   path.join(__dirname, "../../../dist"),
@@ -1785,12 +1849,7 @@ if (frontendDist) {
           .replaceAll(path.sep, "/");
 
         if (relativePath.startsWith("assets/")) {
-          res.setHeader(
-            "Cache-Control",
-            "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
-          );
-          res.setHeader("Pragma", "no-cache");
-          res.setHeader("Expires", "0");
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
           return;
         }
 
@@ -1803,10 +1862,6 @@ if (frontendDist) {
             "Cache-Control",
             "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
           );
-          if (relativePath === "index.html") {
-            res.setHeader("Pragma", "no-cache");
-            res.setHeader("Expires", "0");
-          }
         }
       },
     }),
@@ -1818,8 +1873,6 @@ if (frontendDist) {
         "Cache-Control",
         "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
       );
-      res.setHeader("Pragma", "no-cache");
-      res.setHeader("Expires", "0");
       res.sendFile(path.join(frontendDist, "index.html"));
     } else {
       next();
@@ -2032,13 +2085,15 @@ httpServer.on("error", (err: NodeJS.ErrnoException) => {
   throw err;
 });
 
-httpServer.listen(HTTP_PORT, async () => {
-  const uploadsDir = path.join(process.cwd(), "uploads");
-  if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-  }
+export const serverReady = new Promise<void>((resolve) => {
+  httpServer.listen(HTTP_PORT, async () => {
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
 
-  await initializeSecurity();
+    await initializeSecurity();
+    resolve();
+  });
 });
 
 const sslConfig = AutoSSLSetup.getSSLConfig();

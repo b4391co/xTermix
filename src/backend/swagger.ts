@@ -1,20 +1,13 @@
-import swaggerJSDoc from "@deadendjs/swagger-jsdoc";
+import swaggerJSDoc from "swagger-jsdoc";
 import path from "path";
 import { fileURLToPath } from "url";
 import { promises as fs } from "fs";
 import { systemLogger } from "./utils/logger.js";
 
-interface SwaggerOptions {
-  definition: object;
-  apis: string[];
-}
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const projectRoot = path.join(__dirname, "..", "..", "..");
-
-const swaggerOptions: SwaggerOptions = {
+const swaggerOptions: swaggerJSDoc.Options = {
   definition: {
     openapi: "3.0.3",
     info: {
@@ -123,9 +116,10 @@ const swaggerOptions: SwaggerOptions = {
     ],
   },
   apis: [
-    path.join(projectRoot, "src", "backend", "database", "routes", "*.ts"),
-    path.join(projectRoot, "src", "backend", "dashboard.ts"),
-    path.join(projectRoot, "src", "backend", "ssh", "*.ts"),
+    path.join(__dirname, "database", "routes", "*.js").replace(/\\/g, "/"),
+    path.join(__dirname, "dashboard.js").replace(/\\/g, "/"),
+    path.join(__dirname, "ssh", "*.js").replace(/\\/g, "/"),
+    path.join(__dirname, "guacamole", "routes.js").replace(/\\/g, "/"),
   ],
 };
 
@@ -135,9 +129,9 @@ async function generateOpenAPISpec() {
       operation: "openapi_generate_start",
     });
 
-    const swaggerSpec = await swaggerJSDoc(swaggerOptions);
+    const swaggerSpec = swaggerJSDoc(swaggerOptions);
 
-    const outputPath = path.join(projectRoot, "openapi.json");
+    const outputPath = path.join(__dirname, "..", "..", "..", "openapi.json");
 
     await fs.writeFile(
       outputPath,

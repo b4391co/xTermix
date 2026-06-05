@@ -43,6 +43,8 @@ const router = express.Router();
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+const STATS_SERVER_URL = "http://localhost:30005";
+
 function notifyStatsHostUpdated(
   hostId: number,
   headers: Pick<Request["headers"], "authorization" | "cookie">,
@@ -50,7 +52,7 @@ function notifyStatsHostUpdated(
 ): void {
   axios
     .post(
-      "http://localhost:30005/host-updated",
+      `${STATS_SERVER_URL}/host-updated`,
       { hostId },
       {
         headers: {
@@ -244,252 +246,29 @@ function normalizeImportedHost(
 }
 
 const SENSITIVE_FIELDS = [
-  "password",
   "key",
   "keyPassword",
-  "sudoPassword",
-  "autostartPassword",
   "autostartKey",
   "autostartKeyPassword",
-  "socks5Password",
 ];
 
 function stripSensitiveFields(
   host: Record<string, unknown>,
 ): Record<string, unknown> {
   const result = { ...host };
-  result.hasPassword = !!host.password;
   result.hasKey = !!host.key;
-  result.hasSudoPassword = !!host.sudoPassword;
+  result.hasKeyPassword = !!host.keyPassword;
   for (const field of SENSITIVE_FIELDS) {
     delete result[field];
   }
   return result;
 }
 
-function applySharingCredentialCompatibility(
-  host: Record<string, unknown>,
-): Record<string, unknown> {
-  const result = { ...host };
-  const hasCredentialId =
-    typeof result.credentialId === "number" &&
-    Number.isFinite(result.credentialId) &&
-    result.credentialId > 0;
-
-  if (hasCredentialId) {
-    result.authType = "credential";
-    result.authMethod = "credential";
-    return result;
-  }
-
-  const numericHostId =
-    typeof result.id === "number" && Number.isFinite(result.id) ? result.id : 0;
-  result.credentialId = 1000000000 + Math.max(1, numericHostId);
-  result.authType = "credential";
-  result.authMethod = "credential";
-  result.sharingCompatCredentialInjected = true;
-
-  return result;
-}
-
-function applySharingCredentialCompatibilityForHostDetails(
-  host: Record<string, unknown>,
-): Record<string, unknown> {
-  return applySharingCredentialCompatibility(host);
-}
-
-function normalizeCredentialTags(host: Record<string, unknown>): string {
-  if (Array.isArray(host.tags)) {
-    return host.tags
-      .map((tag) => (typeof tag === "string" ? tag.trim() : ""))
-      .filter(Boolean)
-      .join(",");
-  }
-  if (typeof host.tags === "string") {
-    return host.tags.trim();
-  }
-  return "";
-}
-
-async function ensureHostCredentialForShareCompatibility(
-  host: Record<string, unknown>,
-  requestingUserId: string,
-): Promise<Record<string, unknown>> {
-  const connectionType =
-    typeof host.connectionType === "string" &&
-    host.connectionType.trim().length > 0
-      ? host.connectionType.toLowerCase()
-      : "ssh";
-  if (!["ssh", "rdp", "vnc", "telnet"].includes(connectionType)) {
-    return host;
-  }
-
-  const currentCredentialId =
-    typeof host.credentialId === "number" ? host.credentialId : null;
-  if (currentCredentialId && currentCredentialId > 0) {
-    return host;
-  }
-
-  const hostId = typeof host.id === "number" ? host.id : null;
-  if (!hostId || hostId <= 0) {
-    return host;
-  }
-
-  const ownerId = isNonEmptyString(host.userId)
-    ? host.userId
-    : isNonEmptyString(host.ownerId)
-      ? host.ownerId
-      : null;
-  if (!ownerId || ownerId !== requestingUserId) {
-    return host;
-  }
-
-  const password = isNonEmptyString(host.password) ? host.password : null;
-  const key = isNonEmptyString(host.key) ? host.key : null;
-  const keyPassword = isNonEmptyString(host.keyPassword)
-    ? host.keyPassword
-    : null;
-  const keyType = isNonEmptyString(host.keyType) ? host.keyType : null;
-  const hostAuthType = isNonEmptyString(host.authType)
-    ? host.authType
-    : isNonEmptyString(host.authMethod)
-      ? host.authMethod
-      : null;
-  const authType = key
-    ? "key"
-    : password
-      ? "password"
-      : hostAuthType ||
-        (connectionType === "ssh" ||
-        connectionType === "rdp" ||
-        connectionType === "vnc" ||
-        connectionType === "telnet"
-          ? "password"
-          : null);
-
-  if (!authType) {
-    return host;
-  }
-
-  try {
-    const latestHost = await db
-      .select({
-        credentialId: hosts.credentialId,
-      })
-      .from(hosts)
-      .where(and(eq(hosts.id, hostId), eq(hosts.userId, ownerId)))
-      .limit(1);
-
-    if (
-      latestHost.length > 0 &&
-      typeof latestHost[0].credentialId === "number" &&
-      latestHost[0].credentialId > 0
-    ) {
-      return {
-        ...host,
-        credentialId: latestHost[0].credentialId,
-        authType: "credential",
-      };
-    }
-
-    const credentialNameBase = isNonEmptyString(host.name)
-      ? host.name.trim()
-      : `${host.ip || "host"}:${host.port || ""}`;
-
-    const inserted = (await SimpleDBOps.insert(
-      sshCredentials,
-      "ssh_credentials",
-      {
-        userId: ownerId,
-        name: `[Auto Share] ${credentialNameBase}`,
-        description: `Auto-generated from host ${credentialNameBase} for sharing`,
-        folder: isNonEmptyString(host.folder) ? host.folder : null,
-        tags: normalizeCredentialTags(host),
-        authType,
-        username: isNonEmptyString(host.username) ? host.username : null,
-        password,
-        key,
-        privateKey: key,
-        publicKey: null,
-        keyPassword,
-        keyType,
-        detectedKeyType: keyType,
-        usageCount: 0,
-        lastUsed: null,
-      },
-      ownerId,
-    )) as unknown as { id: number };
-
-    await db
-      .update(hosts)
-      .set({
-        credentialId: inserted.id,
-        authType: "credential",
-        updatedAt: new Date().toISOString(),
-      })
-      .where(and(eq(hosts.id, hostId), eq(hosts.userId, ownerId)));
-
-    sshLogger.info("Auto-created host credential for sharing compatibility", {
-      operation: "host_share_compat_credential_auto_create",
-      userId: requestingUserId,
-      hostId,
-      credentialId: inserted.id,
-      connectionType,
-    });
-
-    return {
-      ...host,
-      credentialId: inserted.id,
-      authType: "credential",
-    };
-  } catch (error) {
-    sshLogger.warn(
-      "Falling back to synthetic sharing credential compatibility for host",
-      {
-        operation: "host_share_compat_credential_fallback",
-        userId: requestingUserId,
-        hostId,
-        connectionType,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-    );
-    return applySharingCredentialCompatibility(host);
-  }
-}
-
 function transformHostResponse(
   host: Record<string, unknown>,
 ): Record<string, unknown> {
-  const parseJsonWithFallback = <T>(
-    value: unknown,
-    fallback: T,
-    fieldName: string,
-  ): T => {
-    if (typeof value !== "string" || value.trim() === "") {
-      return fallback;
-    }
-    try {
-      return JSON.parse(value) as T;
-    } catch (error) {
-      sshLogger.warn("Failed to parse host JSON field, using fallback", {
-        operation: "host_transform_json_parse_fallback",
-        hostId:
-          typeof host.id === "number" && Number.isFinite(host.id) ? host.id : 0,
-        fieldName,
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
-      return fallback;
-    }
-  };
-
-  const transformedHost: Record<string, unknown> = {
+  return {
     ...host,
-    authMethod:
-      typeof host.authType === "string"
-        ? host.authType
-        : typeof host.authMethod === "string"
-          ? host.authMethod
-          : undefined,
     tags:
       typeof host.tags === "string"
         ? host.tags
@@ -506,60 +285,63 @@ function transformHostResponse(
     showTunnelInSidebar: !!host.showTunnelInSidebar,
     showDockerInSidebar: !!host.showDockerInSidebar,
     showServerStatsInSidebar: !!host.showServerStatsInSidebar,
-    tunnelConnections: parseJsonWithFallback(
-      host.tunnelConnections,
-      [],
-      "tunnelConnections",
-    ),
-    jumpHosts: parseJsonWithFallback(host.jumpHosts, [], "jumpHosts"),
-    quickActions: parseJsonWithFallback(host.quickActions, [], "quickActions"),
-    statsConfig: parseJsonWithFallback(
-      host.statsConfig,
-      undefined as unknown as Record<string, unknown> | undefined,
-      "statsConfig",
-    ),
-    terminalConfig: parseJsonWithFallback(
-      host.terminalConfig,
-      undefined as unknown as Record<string, unknown> | undefined,
-      "terminalConfig",
-    ),
-    dockerConfig: parseJsonWithFallback(
-      host.dockerConfig,
-      undefined as unknown as Record<string, unknown> | undefined,
-      "dockerConfig",
-    ),
+    // Old hosts only had connection_type set; the per-protocol enable flags didn't exist yet.
+    // The schema defaults (enableSsh=true, others=false) wrongly mark every old host as SSH.
+    // Detect this migration case: if no non-SSH protocol is explicitly enabled AND
+    // connectionType is set to a non-SSH value, fall back to inferring from connectionType.
+    ...(() => {
+      const ct = host.connectionType;
+      const rdp = !!host.enableRdp;
+      const vnc = !!host.enableVnc;
+      const tel = !!host.enableTelnet;
+      const isMigratedNonSsh = !rdp && !vnc && !tel && ct && ct !== "ssh";
+      return {
+        enableSsh: isMigratedNonSsh ? false : !!host.enableSsh,
+        enableRdp: isMigratedNonSsh ? ct === "rdp" : rdp,
+        enableVnc: isMigratedNonSsh ? ct === "vnc" : vnc,
+        enableTelnet: isMigratedNonSsh ? ct === "telnet" : tel,
+      };
+    })(),
+    sshPort: host.sshPort ?? host.port ?? 22,
+    rdpPort: host.rdpPort ?? 3389,
+    vncPort: host.vncPort ?? 5900,
+    telnetPort: host.telnetPort ?? 23,
+    rdpUser: host.rdpUser || undefined,
+    rdpDomain: host.rdpDomain || undefined,
+    rdpSecurity: host.rdpSecurity || undefined,
+    rdpIgnoreCert: !!host.rdpIgnoreCert,
+    vncUser: host.vncUser || undefined,
+    telnetUser: host.telnetUser || undefined,
+    tunnelConnections: host.tunnelConnections
+      ? JSON.parse(host.tunnelConnections as string)
+      : [],
+    jumpHosts: host.jumpHosts ? JSON.parse(host.jumpHosts as string) : [],
+    quickActions: host.quickActions
+      ? JSON.parse(host.quickActions as string)
+      : [],
+    statsConfig: host.statsConfig
+      ? JSON.parse(host.statsConfig as string)
+      : undefined,
+    terminalConfig: host.terminalConfig
+      ? JSON.parse(host.terminalConfig as string)
+      : undefined,
+    dockerConfig: host.dockerConfig
+      ? JSON.parse(host.dockerConfig as string)
+      : undefined,
     forceKeyboardInteractive: host.forceKeyboardInteractive === "true",
-    socks5ProxyChain: parseJsonWithFallback(
-      host.socks5ProxyChain,
-      [],
-      "socks5ProxyChain",
-    ),
-    portKnockSequence: parseJsonWithFallback(
-      host.portKnockSequence,
-      [],
-      "portKnockSequence",
-    ),
+    socks5ProxyChain: host.socks5ProxyChain
+      ? JSON.parse(host.socks5ProxyChain as string)
+      : [],
+    portKnockSequence: host.portKnockSequence
+      ? JSON.parse(host.portKnockSequence as string)
+      : [],
     domain: host.domain || undefined,
     security: host.security || undefined,
     ignoreCert: !!host.ignoreCert,
-    guacamoleConfig: parseJsonWithFallback(
-      host.guacamoleConfig,
-      undefined as unknown as Record<string, unknown> | undefined,
-      "guacamoleConfig",
-    ),
+    guacamoleConfig: host.guacamoleConfig
+      ? JSON.parse(host.guacamoleConfig as string)
+      : undefined,
   };
-
-  const connectionTypeValue = transformedHost["connectionType"];
-  const connectionType =
-    typeof connectionTypeValue === "string" &&
-    connectionTypeValue.trim().length > 0
-      ? connectionTypeValue.toLowerCase()
-      : "ssh";
-  if (["ssh", "rdp", "vnc", "telnet"].includes(connectionType)) {
-    return applySharingCredentialCompatibility(transformedHost);
-  }
-
-  return transformedHost;
 }
 
 const authManager = AuthManager.getInstance();
@@ -627,20 +409,16 @@ router.get("/db/host/internal", async (req: Request, res: Response) => {
           return null;
         }
 
-        const compatibilityHost = applySharingCredentialCompatibility({
-          ...host,
-        });
         return {
           id: host.id,
           userId: host.userId,
-          connectionType: host.connectionType,
           name: host.name || `autostart-${host.id}`,
           ip: host.ip,
           port: host.port,
           username: host.username,
-          authType: compatibilityHost.authType as string,
+          authType: host.authType,
           keyType: host.keyType,
-          credentialId: compatibilityHost.credentialId as number,
+          credentialId: host.credentialId,
           enableTunnel: true,
           tunnelConnections: tunnelConnections.filter(
             (tunnel: Record<string, unknown>) => tunnel.autoStart,
@@ -705,21 +483,17 @@ router.get("/db/host/internal/all", async (req: Request, res: Response) => {
       const tunnelConnections = host.tunnelConnections
         ? JSON.parse(host.tunnelConnections)
         : [];
-      const compatibilityHost = applySharingCredentialCompatibility({
-        ...host,
-      });
 
       return {
         id: host.id,
         userId: host.userId,
-        connectionType: host.connectionType,
         name: host.name || `${host.username}@${host.ip}`,
         ip: host.ip,
         port: host.port,
         username: host.username,
-        authType: compatibilityHost.authType as string,
+        authType: host.authType,
         keyType: host.keyType,
-        credentialId: compatibilityHost.credentialId as number,
+        credentialId: host.credentialId,
         enableTunnel: !!host.enableTunnel,
         tunnelConnections: tunnelConnections,
         pin: !!host.pin,
@@ -843,6 +617,23 @@ router.post(
       portKnockSequence,
       overrideCredentialUsername,
       macAddress,
+      enableSsh,
+      enableRdp,
+      enableVnc,
+      enableTelnet,
+      sshPort,
+      rdpPort,
+      vncPort,
+      telnetPort,
+      rdpUser,
+      rdpPassword,
+      rdpDomain,
+      rdpSecurity,
+      rdpIgnoreCert,
+      vncPassword,
+      vncUser,
+      telnetUser,
+      telnetPassword,
     } = hostData;
     databaseLogger.info("Creating SSH host", {
       operation: "host_create",
@@ -871,15 +662,19 @@ router.post(
       authType ||
       authMethod ||
       (effectiveConnectionType !== "ssh" ? "password" : undefined);
+    const effectiveUsername =
+      username || rdpUser || vncUser || telnetUser || "";
+    const effectiveName =
+      name || (effectiveUsername ? `${effectiveUsername}@${ip}` : String(ip));
     const sshDataObj: Record<string, unknown> = {
       userId: userId,
       connectionType: effectiveConnectionType,
-      name,
+      name: effectiveName,
       folder: folder || null,
       tags: Array.isArray(tags) ? tags.join(",") : tags || "",
       ip,
       port,
-      username,
+      username: effectiveUsername,
       authType: effectiveAuthType,
       credentialId: credentialId || null,
       overrideCredentialUsername: overrideCredentialUsername ? 1 : 0,
@@ -935,6 +730,20 @@ router.post(
       portKnockSequence: portKnockSequence
         ? JSON.stringify(portKnockSequence)
         : null,
+      enableSsh: enableSsh ? 1 : 0,
+      enableRdp: enableRdp ? 1 : 0,
+      enableVnc: enableVnc ? 1 : 0,
+      enableTelnet: enableTelnet ? 1 : 0,
+      sshPort: sshPort || port || 22,
+      rdpPort: rdpPort || 3389,
+      vncPort: vncPort || 5900,
+      telnetPort: telnetPort || 23,
+      rdpUser: rdpUser || null,
+      rdpDomain: rdpDomain || null,
+      rdpSecurity: rdpSecurity || null,
+      rdpIgnoreCert: rdpIgnoreCert ? 1 : 0,
+      vncUser: vncUser || null,
+      telnetUser: telnetUser || null,
     };
 
     // For non-SSH hosts (RDP, VNC, Telnet), always save password if provided
@@ -992,6 +801,10 @@ router.post(
       sshDataObj.keyPassword = null;
       sshDataObj.keyType = null;
     }
+
+    sshDataObj.rdpPassword = rdpPassword || null;
+    sshDataObj.vncPassword = vncPassword || null;
+    sshDataObj.telnetPassword = telnetPassword || null;
 
     try {
       const result = await SimpleDBOps.insert(
@@ -1342,6 +1155,23 @@ router.put(
       portKnockSequence,
       overrideCredentialUsername,
       macAddress,
+      enableSsh,
+      enableRdp,
+      enableVnc,
+      enableTelnet,
+      sshPort,
+      rdpPort,
+      vncPort,
+      telnetPort,
+      rdpUser,
+      rdpPassword,
+      rdpDomain,
+      rdpSecurity,
+      rdpIgnoreCert,
+      vncPassword,
+      vncUser,
+      telnetUser,
+      telnetPassword,
     } = hostData;
     databaseLogger.info("Updating SSH host", {
       operation: "host_update",
@@ -1368,14 +1198,18 @@ router.put(
     }
 
     const effectiveAuthType = authType || authMethod;
+    const effectiveUsername =
+      username || rdpUser || vncUser || telnetUser || "";
+    const effectiveName =
+      name || (effectiveUsername ? `${effectiveUsername}@${ip}` : String(ip));
     const sshDataObj: Record<string, unknown> = {
       connectionType: connectionType || "ssh",
-      name,
+      name: effectiveName,
       folder,
       tags: Array.isArray(tags) ? tags.join(",") : tags || "",
       ip,
       port,
-      username,
+      username: effectiveUsername,
       authType: effectiveAuthType,
       credentialId: credentialId || null,
       overrideCredentialUsername: overrideCredentialUsername ? 1 : 0,
@@ -1431,6 +1265,20 @@ router.put(
       portKnockSequence: portKnockSequence
         ? JSON.stringify(portKnockSequence)
         : null,
+      enableSsh: enableSsh ? 1 : 0,
+      enableRdp: enableRdp ? 1 : 0,
+      enableVnc: enableVnc ? 1 : 0,
+      enableTelnet: enableTelnet ? 1 : 0,
+      sshPort: sshPort || port || 22,
+      rdpPort: rdpPort || 3389,
+      vncPort: vncPort || 5900,
+      telnetPort: telnetPort || 23,
+      rdpUser: rdpUser || null,
+      rdpDomain: rdpDomain || null,
+      rdpSecurity: rdpSecurity || null,
+      rdpIgnoreCert: rdpIgnoreCert ? 1 : 0,
+      vncUser: vncUser || null,
+      telnetUser: telnetUser || null,
     };
 
     // For non-SSH hosts (RDP, VNC, Telnet), always save password if provided
@@ -1498,6 +1346,11 @@ router.put(
       sshDataObj.keyPassword = null;
       sshDataObj.keyType = null;
     }
+
+    if (rdpPassword !== undefined) sshDataObj.rdpPassword = rdpPassword || null;
+    if (vncPassword !== undefined) sshDataObj.vncPassword = vncPassword || null;
+    if (telnetPassword !== undefined)
+      sshDataObj.telnetPassword = telnetPassword || null;
 
     try {
       const accessInfo = await permissionManager.canAccessHost(
@@ -1725,6 +1578,23 @@ router.get(
           guacamoleConfig: hosts.guacamoleConfig,
           macAddress: hosts.macAddress,
           dockerConfig: hosts.dockerConfig,
+          enableSsh: hosts.enableSsh,
+          enableRdp: hosts.enableRdp,
+          enableVnc: hosts.enableVnc,
+          enableTelnet: hosts.enableTelnet,
+          sshPort: hosts.sshPort,
+          rdpPort: hosts.rdpPort,
+          vncPort: hosts.vncPort,
+          telnetPort: hosts.telnetPort,
+          rdpUser: hosts.rdpUser,
+          rdpPassword: hosts.rdpPassword,
+          rdpDomain: hosts.rdpDomain,
+          rdpSecurity: hosts.rdpSecurity,
+          rdpIgnoreCert: hosts.rdpIgnoreCert,
+          vncUser: hosts.vncUser,
+          vncPassword: hosts.vncPassword,
+          telnetUser: hosts.telnetUser,
+          telnetPassword: hosts.telnetPassword,
 
           ownerId: hosts.userId,
           isShared: sql<boolean>`${hostAccess.id} IS NOT NULL AND ${hosts.userId} != ${userId}`,
@@ -1767,7 +1637,7 @@ router.get(
       const ownHosts = rawData.filter((row) => row.userId === userId);
       const sharedHosts = rawData.filter((row) => row.userId !== userId);
 
-      let decryptedOwnHosts: Record<string, unknown>[] = [];
+      const decryptedOwnHosts: Record<string, unknown>[] = [];
       const userDataKey = DataCrypto.getUserDataKey(userId);
       if (userDataKey) {
         for (const host of ownHosts) {
@@ -1789,27 +1659,14 @@ router.get(
         }
       }
 
-      if (decryptedOwnHosts.length === 0 && ownHosts.length > 0) {
-        sshLogger.warn("Using raw own hosts fallback after empty decrypt result", {
-          operation: "host_fetch_own_raw_fallback",
-          userId,
-          hostCount: ownHosts.length,
-        });
-        decryptedOwnHosts = ownHosts;
-      }
-
       const sanitizedSharedHosts = sharedHosts;
 
       const data = [...decryptedOwnHosts, ...sanitizedSharedHosts];
 
       const result = await Promise.all(
         data.map(async (row: Record<string, unknown>) => {
-          const compatibilityRow = await ensureHostCredentialForShareCompatibility(
-            row,
-            userId,
-          );
           const baseHost = {
-            ...transformHostResponse(compatibilityRow),
+            ...transformHostResponse(row),
             isShared: !!row.isShared,
             permissionLevel: row.permissionLevel || undefined,
             sharedExpiresAt: row.expiresAt || undefined,
@@ -1821,9 +1678,7 @@ router.get(
         }),
       );
 
-      const sanitized = result.map((host) =>
-        stripSensitiveFields(applySharingCredentialCompatibility(host)),
-      );
+      const sanitized = result.map((host) => stripSensitiveFields(host));
       res.json(sanitized);
     } catch (err) {
       sshLogger.error("Failed to fetch SSH hosts from database", err, {
@@ -1862,6 +1717,7 @@ router.get(
 router.get(
   "/db/host/:id",
   authenticateJWT,
+  requireDataAccess,
   async (req: Request, res: Response) => {
     const hostId = Array.isArray(req.params.id)
       ? req.params.id[0]
@@ -1877,25 +1733,14 @@ router.get(
       return res.status(400).json({ error: "Invalid userId or hostId" });
     }
     try {
-      const numericHostId = Number(hostId);
-
-      let data: Record<string, unknown>[] = [];
-      data = await SimpleDBOps.select(
-        db.select().from(hosts).where(eq(hosts.id, numericHostId)),
+      const data = await SimpleDBOps.select(
+        db
+          .select()
+          .from(hosts)
+          .where(and(eq(hosts.id, Number(hostId)), eq(hosts.userId, userId))),
         "ssh_data",
         userId,
       );
-
-      if (data.length === 0) {
-        const rawFallback = await db
-          .select()
-          .from(hosts)
-          .where(eq(hosts.id, numericHostId))
-          .limit(1);
-        if (rawFallback.length > 0) {
-          data = rawFallback as unknown as Record<string, unknown>[];
-        }
-      }
 
       if (data.length === 0) {
         sshLogger.warn("SSH host not found", {
@@ -1906,121 +1751,14 @@ router.get(
         return res.status(404).json({ error: "SSH host not found" });
       }
 
-      const host = await ensureHostCredentialForShareCompatibility(
-        data[0],
-        userId,
-      );
+      const host = data[0];
       const result = transformHostResponse(host);
       const resolved = (await resolveHostCredentials(result, userId)) || result;
-      res.json(
-        stripSensitiveFields(
-          applySharingCredentialCompatibilityForHostDetails(resolved),
-        ),
-      );
+
+      res.json(stripSensitiveFields(resolved));
     } catch (err) {
       sshLogger.error("Failed to fetch SSH host by ID from database", err, {
         operation: "host_fetch_by_id",
-        hostId: parseInt(hostId),
-        userId,
-      });
-
-      try {
-        const emergencyRows = await db
-          .select()
-          .from(hosts)
-          .where(eq(hosts.id, Number(hostId)))
-          .limit(1);
-
-        if (emergencyRows.length > 0) {
-          const emergencyBase = transformHostResponse(emergencyRows[0]);
-          const emergencyResolved =
-            (await resolveHostCredentials(emergencyBase, userId)) ||
-            emergencyBase;
-          const emergencySafe = stripSensitiveFields(
-            applySharingCredentialCompatibilityForHostDetails(emergencyResolved),
-          );
-          sshLogger.warn("Served host by emergency compatibility fallback", {
-            operation: "host_fetch_by_id_emergency_fallback",
-            hostId: parseInt(hostId),
-            userId,
-          });
-          return res.json(emergencySafe);
-        }
-      } catch (fallbackError) {
-        sshLogger.error(
-          "Emergency fallback failed while fetching host by ID",
-          fallbackError,
-          {
-            operation: "host_fetch_by_id_emergency_fallback_failed",
-            hostId: parseInt(hostId),
-            userId,
-          },
-        );
-      }
-
-      res.status(500).json({ error: "Failed to fetch SSH host" });
-    }
-  },
-);
-
-router.get(
-  "/db/host/:id/with-credentials",
-  authenticateJWT,
-  async (req: Request, res: Response) => {
-    const hostId = Array.isArray(req.params.id)
-      ? req.params.id[0]
-      : req.params.id;
-    const userId = (req as AuthenticatedRequest).userId;
-
-    if (!isNonEmptyString(userId) || !hostId) {
-      sshLogger.warn("Invalid userId or hostId for SSH host fetch by ID", {
-        operation: "host_fetch_with_credentials",
-        hostId: parseInt(hostId),
-        userId,
-      });
-      return res.status(400).json({ error: "Invalid userId or hostId" });
-    }
-
-    try {
-      const numericHostId = Number(hostId);
-
-      let data: Record<string, unknown>[] = [];
-      data = await SimpleDBOps.select(
-        db.select().from(hosts).where(eq(hosts.id, numericHostId)),
-        "ssh_data",
-        userId,
-      );
-
-      if (data.length === 0) {
-        const rawFallback = await db
-          .select()
-          .from(hosts)
-          .where(eq(hosts.id, numericHostId))
-          .limit(1);
-        if (rawFallback.length > 0) {
-          data = rawFallback as unknown as Record<string, unknown>[];
-        }
-      }
-
-      if (data.length === 0) {
-        return res.status(404).json({ error: "SSH host not found" });
-      }
-
-      const host = await ensureHostCredentialForShareCompatibility(
-        data[0],
-        userId,
-      );
-      const result = transformHostResponse(host);
-      const resolved = (await resolveHostCredentials(result, userId)) || result;
-
-      res.json(
-        stripSensitiveFields(
-          applySharingCredentialCompatibilityForHostDetails(resolved),
-        ),
-      );
-    } catch (err) {
-      sshLogger.error("Failed to fetch SSH host with credentials", err, {
-        operation: "host_fetch_with_credentials_failed",
         hostId: parseInt(hostId),
         userId,
       });
@@ -2182,9 +1920,21 @@ router.get(
       const exportData = isRemoteDesktop
         ? {
             ...baseExportData,
-            domain: resolvedHost.domain || null,
-            security: resolvedHost.security || null,
-            ignoreCert: !!resolvedHost.ignoreCert,
+            enableRdp: !!resolvedHost.enableRdp,
+            enableVnc: !!resolvedHost.enableVnc,
+            enableTelnet: !!resolvedHost.enableTelnet,
+            rdpPort: resolvedHost.rdpPort || 3389,
+            vncPort: resolvedHost.vncPort || 5900,
+            telnetPort: resolvedHost.telnetPort || 23,
+            rdpUser: resolvedHost.rdpUser || null,
+            rdpPassword: resolvedHost.rdpPassword || null,
+            rdpDomain: resolvedHost.rdpDomain || null,
+            rdpSecurity: resolvedHost.rdpSecurity || null,
+            rdpIgnoreCert: !!resolvedHost.rdpIgnoreCert,
+            vncUser: resolvedHost.vncUser || null,
+            vncPassword: resolvedHost.vncPassword || null,
+            telnetUser: resolvedHost.telnetUser || null,
+            telnetPassword: resolvedHost.telnetPassword || null,
             guacamoleConfig: resolvedHost.guacamoleConfig
               ? JSON.parse(resolvedHost.guacamoleConfig as string)
               : null,
@@ -2508,9 +2258,8 @@ router.delete(
 
       try {
         const axios = (await import("axios")).default;
-        const statsPort = 30005;
         await axios.post(
-          `http://localhost:${statsPort}/host-deleted`,
+          `${STATS_SERVER_URL}/host-deleted`,
           { hostId: numericHostId },
           {
             headers: {
@@ -3292,7 +3041,7 @@ async function resolveHostCredentials(
             };
 
             if (!host.overrideCredentialUsername) {
-              resolvedHost.username = sharedCred.username || host.username;
+              resolvedHost.username = sharedCred.username;
             }
 
             return resolvedHost;
@@ -3685,11 +3434,10 @@ router.delete(
 
       try {
         const axios = (await import("axios")).default;
-        const statsPort = 30005;
         for (const host of hostsToDelete) {
           try {
             await axios.post(
-              `http://localhost:${statsPort}/host-deleted`,
+              `${STATS_SERVER_URL}/host-deleted`,
               { hostId: host.id },
               {
                 headers: {
@@ -4095,6 +3843,10 @@ router.post(
           overrideCredentialUsername: hostData.overrideCredentialUsername
             ? 1
             : 0,
+          enableSsh: hostData.enableSsh ?? false,
+          enableRdp: hostData.enableRdp ?? false,
+          enableVnc: hostData.enableVnc ?? false,
+          enableTelnet: hostData.enableTelnet ?? false,
           updatedAt: new Date().toISOString(),
         };
 
@@ -4105,9 +3857,21 @@ router.post(
           sshDataObj.key = null;
           sshDataObj.keyPassword = null;
           sshDataObj.keyType = null;
-          sshDataObj.domain = hostData.domain || null;
-          sshDataObj.security = hostData.security || null;
-          sshDataObj.ignoreCert = hostData.ignoreCert ? 1 : 0;
+          sshDataObj.rdpUser = hostData.rdpUser || null;
+          sshDataObj.rdpPassword = hostData.rdpPassword || null;
+          sshDataObj.rdpDomain = hostData.rdpDomain || null;
+          sshDataObj.rdpSecurity = hostData.rdpSecurity || null;
+          sshDataObj.rdpIgnoreCert = hostData.rdpIgnoreCert ? 1 : 0;
+          sshDataObj.rdpPort = hostData.rdpPort || 3389;
+          sshDataObj.vncUser = hostData.vncUser || null;
+          sshDataObj.vncPassword = hostData.vncPassword || null;
+          sshDataObj.vncPort = hostData.vncPort || 5900;
+          sshDataObj.telnetUser = hostData.telnetUser || null;
+          sshDataObj.telnetPassword = hostData.telnetPassword || null;
+          sshDataObj.telnetPort = hostData.telnetPort || 23;
+          sshDataObj.enableRdp = hostData.enableRdp ? 1 : 0;
+          sshDataObj.enableVnc = hostData.enableVnc ? 1 : 0;
+          sshDataObj.enableTelnet = hostData.enableTelnet ? 1 : 0;
           sshDataObj.guacamoleConfig = hostData.guacamoleConfig
             ? JSON.stringify(hostData.guacamoleConfig)
             : null;

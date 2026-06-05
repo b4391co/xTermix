@@ -3,6 +3,7 @@ import fs from "fs";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import svgr from "vite-plugin-svgr";
 
 const sslCertPath = path.join(process.cwd(), "ssl/termix.crt");
 const sslKeyPath = path.join(process.cwd(), "ssl/termix.key");
@@ -52,7 +53,6 @@ const manualChunkGroups: Record<string, string[]> = {
   ],
   "remote-desktop-vendor": ["guacamole-common-js"],
   "graph-vendor": ["cytoscape", "react-cytoscapejs"],
-  "chart-vendor": ["recharts"],
   "file-preview-vendor": [
     "react-pdf",
     "pdfjs-dist",
@@ -83,7 +83,7 @@ function getManualChunk(id: string): string | undefined {
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), svgr()],
   define: {
     "import.meta.env.VITE_APP_VERSION": JSON.stringify(
       packageJson.version || "0.0.0",
@@ -91,7 +91,8 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@/types": path.resolve(__dirname, "./src/types"),
+      "@": path.resolve(__dirname, "./src/ui"),
     },
   },
   base: process.env.VITE_BASE_PATH || "./",
@@ -112,36 +113,6 @@ export default defineConfig({
         }
       : false,
     port: 5173,
-    host: "0.0.0.0",
-    allowedHosts: ["localhost"],
-    proxy: {
-      "/api": {
-        target: "http://127.0.0.1:30001",
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ""),
-      },
-      "/ssh/websocket": {
-        target: "ws://127.0.0.1:30002",
-        ws: true,
-        changeOrigin: true,
-      },
-      "/guacamole/websocket": {
-        target: "ws://127.0.0.1:30008",
-        ws: true,
-        changeOrigin: true,
-      },
-    },
-  },
-  preview: {
-    host: "0.0.0.0",
-    port: 5173,
-    strictPort: true,
-    headers: {
-      "Cache-Control":
-        "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
-      "Content-Security-Policy": "upgrade-insecure-requests",
-      Pragma: "no-cache",
-      Expires: "0",
-    },
+    host: "localhost",
   },
 });

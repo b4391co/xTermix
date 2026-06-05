@@ -83,28 +83,8 @@ class SharedCredentialManager {
           return;
         }
 
-        let credentialData: CredentialData;
-        try {
-          credentialData =
-            await this.getDecryptedCredentialViaSystemKey(originalCredentialId);
-        } catch (error) {
-          databaseLogger.warn(
-            "Owner data key and system credential copy unavailable; creating pending shared credential",
-            {
-              operation: "create_shared_credential_pending_fallback",
-              hostAccessId,
-              originalCredentialId,
-              targetUserId,
-              error: error instanceof Error ? error.message : "Unknown error",
-            },
-          );
-          await this.createPendingSharedCredential(
-            hostAccessId,
-            originalCredentialId,
-            targetUserId,
-          );
-          return;
-        }
+        const credentialData =
+          await this.getDecryptedCredentialViaSystemKey(originalCredentialId);
 
         const encryptedForTarget = this.encryptCredentialForUser(
           credentialData,
@@ -386,7 +366,7 @@ class SharedCredentialManager {
     const cred = creds[0];
 
     return {
-      username: cred.username || "",
+      username: cred.username,
       authType: cred.authType,
       password: cred.password
         ? this.decryptField(cred.password, ownerDEK, credentialId, "password")
@@ -433,7 +413,7 @@ class SharedCredentialManager {
     const CSKEK = await systemCrypto.getCredentialSharingKey();
 
     return {
-      username: cred.username || "",
+      username: cred.username,
       authType: cred.authType,
       password: cred.systemPassword
         ? this.decryptField(
@@ -475,7 +455,7 @@ class SharedCredentialManager {
 
     return {
       encryptedUsername: FieldCrypto.encryptField(
-        credentialData.username || "",
+        credentialData.username,
         targetDEK,
         recordId,
         "username",

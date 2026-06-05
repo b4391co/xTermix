@@ -423,6 +423,7 @@ app.commandLine.appendSwitch("--enable-features=NetworkService");
 
 let mainWindow = null;
 let backendProcess = null;
+let backendStartFailed = false;
 let tray = null;
 let isQuitting = false;
 
@@ -560,13 +561,24 @@ async function clearElectronJwtCookiesAtStartup() {
   }
 }
 
-function getBackendEntryPath() {
+function getBackendPaths() {
   if (isDev) {
-    return path.join(appRoot, "dist", "backend", "backend", "starter.js");
+    const backendDir = path.join(appRoot, "dist", "backend", "backend");
+    return {
+      entryPath: path.join(backendDir, "starter.js"),
+      backendCwd: backendDir,
+    };
   }
-  // Backend is asarUnpack'd — fork() cannot run files inside .asar archives
-  const unpackedRoot = appRoot.replace("app.asar", "app.asar.unpacked");
-  return path.join(unpackedRoot, "dist", "backend", "backend", "starter.js");
+  // fork() does not go through Electron's asar redirector — use the unpacked path
+  const unpackedRoot = appRoot.replace(
+    /app\.asar(?!\.unpacked)/,
+    "app.asar.unpacked",
+  );
+  const backendDir = path.join(unpackedRoot, "dist", "backend", "backend");
+  return {
+    entryPath: path.join(backendDir, "starter.js"),
+    backendCwd: backendDir,
+  };
 }
 
 function getBackendDataDir() {
@@ -580,7 +592,7 @@ function getBackendDataDir() {
 
 function startBackendServer() {
   return new Promise((resolve) => {
-    const entryPath = getBackendEntryPath();
+    const { entryPath, backendCwd } = getBackendPaths();
 
     logToFile("isDev:", isDev, "appRoot:", appRoot);
     logToFile("app.isPackaged:", app.isPackaged);
@@ -596,24 +608,18 @@ function startBackendServer() {
     logToFile("Starting embedded backend server...");
     logToFile("Backend entry:", entryPath);
     logToFile("Data directory:", dataDir);
-    logToFile("Backend cwd:", path.dirname(entryPath));
+    logToFile("Backend cwd:", backendCwd);
 
     logToFile("Checking paths...");
     logToFile("  entryPath exists:", fs.existsSync(entryPath));
     logToFile("  dataDir exists:", fs.existsSync(dataDir));
-    logToFile("  appRoot exists:", fs.existsSync(appRoot));
-
-    const distPath = path.join(appRoot, "dist");
-    if (fs.existsSync(distPath)) {
-      logToFile("  dist directory contents:", fs.readdirSync(distPath));
-      const backendPath = path.join(distPath, "backend");
-      if (fs.existsSync(backendPath)) {
-        logToFile("  dist/backend contents:", fs.readdirSync(backendPath));
-      }
-    }
+    logToFile("  backendCwd exists:", fs.existsSync(backendCwd));
 
     backendProcess = fork(entryPath, [], {
-      cwd: path.dirname(entryPath),
+      cwd:
+        fs.existsSync(backendCwd) && fs.statSync(backendCwd).isDirectory()
+          ? backendCwd
+          : dataDir,
       env: {
         ...process.env,
         DATA_DIR: dataDir,
@@ -652,6 +658,9 @@ function startBackendServer() {
 
     backendProcess.on("exit", (code, signal) => {
       logToFile(`Backend process exited with code ${code}, signal ${signal}`);
+      if (!resolved && code !== 0) {
+        backendStartFailed = true;
+      }
       backendProcess = null;
       if (!resolved) {
         resolved = true;
@@ -716,15 +725,21 @@ function createTray() {
   try {
     const { nativeImage } = require("electron");
 
+    // Native APIs (Tray, nativeImage) can't load files from inside app.asar —
+    // use the unpacked path so the OS sees a real file.
+    const publicRoot = isDev
+      ? path.join(appRoot, "public")
+      : path.join(appRoot.replace("app.asar", "app.asar.unpacked"), "public");
+
     let trayIcon;
     if (process.platform === "darwin") {
-      const iconPath = path.join(appRoot, "public", "icons", "16x16.png");
+      const iconPath = path.join(publicRoot, "icons", "16x16.png");
       trayIcon = nativeImage.createFromPath(iconPath);
       trayIcon.setTemplateImage(true);
     } else if (process.platform === "win32") {
-      trayIcon = path.join(appRoot, "public", "icon.ico");
+      trayIcon = path.join(publicRoot, "icon.ico");
     } else {
-      trayIcon = path.join(appRoot, "public", "icons", "32x32.png");
+      trayIcon = path.join(publicRoot, "icons", "32x32.png");
     }
 
     tray = new Tray(trayIcon);
@@ -918,6 +933,7 @@ function createWindow() {
 
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
+    mainWindow.focus();
   });
 
   setTimeout(() => {
@@ -954,7 +970,14 @@ function createWindow() {
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        shell.openExternal(url);
+      }
+    } catch {
+      // invalid URL, ignore
+    }
     return { action: "deny" };
   });
 }
@@ -1074,11 +1097,59 @@ ipcMain.handle("get-platform", () => {
 
 ipcMain.handle("get-embedded-server-status", () => {
   return {
-    running: backendProcess !== null && !backendProcess.killed,
+    running:
+      backendProcess !== null && !backendProcess.killed && !backendStartFailed,
     embedded: !isDev,
     dataDir: isDev ? null : getBackendDataDir(),
   };
 });
+
+// OIDC System Browser Authentication (RFC 8252)
+ipcMain.handle(
+  "oidc-system-browser-auth",
+  async (_event, authUrl, callbackPort) => {
+    const http = require("http");
+
+    return new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        const url = new URL(req.url, `http://localhost:${callbackPort}`);
+        if (url.pathname === "/oidc-callback") {
+          const success = url.searchParams.get("success");
+          const error = url.searchParams.get("error");
+          const token = url.searchParams.get("token");
+
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end(
+            `<html><body><h2>${success === "true" ? "Authentication successful!" : "Authentication failed."}</h2><p>You can close this tab and return to Termix.</p><script>window.close()</script></body></html>`,
+          );
+
+          server.close();
+          if (success === "true") {
+            resolve({ success: true, token });
+          } else {
+            resolve({
+              success: false,
+              error: error || "Authentication failed",
+            });
+          }
+        }
+      });
+
+      server.listen(callbackPort, "127.0.0.1", () => {
+        shell.openExternal(authUrl);
+      });
+
+      // Timeout after 5 minutes
+      setTimeout(
+        () => {
+          server.close();
+          reject(new Error("OIDC authentication timed out"));
+        },
+        5 * 60 * 1000,
+      );
+    });
+  },
+);
 
 ipcMain.handle("get-server-config", () => {
   try {
@@ -2532,6 +2603,9 @@ app.on("window-all-closed", () => {
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
+  } else if (mainWindow) {
+    mainWindow.show();
+    mainWindow.focus();
   }
 });
 

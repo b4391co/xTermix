@@ -4,21 +4,19 @@ import { db } from "../db/index.js";
 import {
   hostAccess,
   hosts,
-  sshCredentials,
   users,
   roles,
   userRoles,
   sharedCredentials,
   snippets,
   snippetAccess,
+  sshCredentials,
 } from "../db/schema.js";
 import { eq, and, desc, sql, or, isNull, gte } from "drizzle-orm";
 import type { Response } from "express";
 import { databaseLogger } from "../../utils/logger.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { PermissionManager } from "../../utils/permission-manager.js";
-import { SimpleDBOps } from "../../utils/simple-db-ops.js";
-import { SharedCredentialManager } from "../../utils/shared-credential-manager.js";
 
 const router = express.Router();
 
@@ -29,276 +27,6 @@ const authenticateJWT = authManager.createAuthMiddleware();
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
-}
-
-async function ensureHostCredentialForSharing(
-  host: typeof hosts.$inferSelect,
-  actingUserId: string,
-): Promise<number | null> {
-  if (host.credentialId && host.credentialId > 0) {
-    return host.credentialId;
-  }
-
-  const ownerId = host.userId;
-  if (!isNonEmptyString(ownerId)) {
-    databaseLogger.warn(
-      "Host owner not found; sharing access without generated credential",
-      {
-        operation: "rbac_share_without_owner",
-        hostId: host.id,
-        actingUserId,
-        connectionType: host.connectionType,
-      },
-    );
-    return null;
-  }
-
-  let ownerHostRows: typeof hosts.$inferSelect[] = [];
-  try {
-    ownerHostRows = (await SimpleDBOps.select(
-      db.select().from(hosts).where(eq(hosts.id, host.id)).limit(1),
-      "ssh_data",
-      ownerId,
-    )) as typeof hosts.$inferSelect[];
-  } catch (error) {
-    databaseLogger.warn(
-      "Host owner credentials locked or unavailable; sharing without auto-generated credential",
-      {
-        operation: "rbac_share_owner_credentials_locked_fallback",
-        hostId: host.id,
-        ownerId,
-        actingUserId,
-        connectionType: host.connectionType,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-    );
-    return null;
-  }
-
-  if (ownerHostRows.length === 0) {
-    databaseLogger.warn(
-      "Host owner data is locked; sharing without auto-generated credential",
-      {
-        operation: "rbac_share_without_unlocked_owner_data",
-        hostId: host.id,
-        ownerId,
-        actingUserId,
-      },
-    );
-    return null;
-  }
-
-  const ownerHost = ownerHostRows[0] as typeof hosts.$inferSelect;
-  const password = isNonEmptyString(ownerHost.password)
-    ? ownerHost.password
-    : null;
-  const key = isNonEmptyString(ownerHost.key) ? ownerHost.key : null;
-  const keyPassword = isNonEmptyString(ownerHost.keyPassword)
-    ? ownerHost.keyPassword
-    : null;
-  const keyType = isNonEmptyString(ownerHost.keyType) ? ownerHost.keyType : null;
-  const connectionType = isNonEmptyString(ownerHost.connectionType)
-    ? ownerHost.connectionType.toLowerCase()
-    : "ssh";
-  const hostAuthType = isNonEmptyString(ownerHost.authType)
-    ? ownerHost.authType
-    : isNonEmptyString((ownerHost as Record<string, unknown>).authMethod)
-      ? String((ownerHost as Record<string, unknown>).authMethod)
-      : null;
-  const authType = key
-    ? "key"
-    : password
-      ? "password"
-      : hostAuthType ||
-        (connectionType === "ssh" ||
-        connectionType === "rdp" ||
-        connectionType === "vnc" ||
-        connectionType === "telnet"
-          ? "password"
-          : null);
-
-  if (!authType) {
-    databaseLogger.info(
-      "Host has no auth type; sharing access without generated credential",
-      {
-        operation: "rbac_share_without_host_auth_material",
-        hostId: host.id,
-        ownerId,
-        actingUserId,
-        connectionType: ownerHost.connectionType,
-      },
-    );
-    return null;
-  }
-
-  const credentialNameBase = isNonEmptyString(ownerHost.name)
-    ? ownerHost.name.trim()
-    : `${ownerHost.ip}:${ownerHost.port}`;
-  const createdCredential = (await SimpleDBOps.insert(
-    sshCredentials,
-    "ssh_credentials",
-    {
-      userId: ownerId,
-      name: `[Auto Share] ${credentialNameBase}`,
-      description: `Auto-generated from host ${credentialNameBase} for sharing`,
-      folder: isNonEmptyString(ownerHost.folder) ? ownerHost.folder : null,
-      tags: isNonEmptyString(ownerHost.tags) ? ownerHost.tags : "",
-      authType,
-      username: isNonEmptyString(ownerHost.username) ? ownerHost.username : null,
-      password,
-      key,
-      privateKey: key,
-      publicKey: null,
-      keyPassword,
-      keyType,
-      detectedKeyType: keyType,
-      usageCount: 0,
-      lastUsed: null,
-    },
-    ownerId,
-  )) as unknown as { id: number };
-
-  await db
-    .update(hosts)
-    .set({
-      credentialId: createdCredential.id,
-      authType: "credential",
-      updatedAt: new Date().toISOString(),
-    })
-    .where(eq(hosts.id, host.id));
-
-  databaseLogger.info("Auto-created credential for host sharing", {
-    operation: "rbac_auto_create_credential_for_sharing",
-    hostId: host.id,
-    ownerId,
-    actingUserId,
-    credentialId: createdCredential.id,
-    connectionType: ownerHost.connectionType,
-  });
-
-  return createdCredential.id;
-}
-
-async function createSharedCredentialBestEffort(params: {
-  hostAccessId: number;
-  effectiveCredentialId: number | null;
-  targetType: "user" | "role";
-  targetUserId?: string;
-  targetRoleId?: number;
-  ownerId: string | null;
-  actingUserId: string;
-  hostId: number;
-}): Promise<void> {
-  const {
-    hostAccessId,
-    effectiveCredentialId,
-    targetType,
-    targetUserId,
-    targetRoleId,
-    ownerId,
-    actingUserId,
-    hostId,
-  } = params;
-
-  if (!effectiveCredentialId || !ownerId) {
-    return;
-  }
-
-  try {
-    const sharedCredManager = SharedCredentialManager.getInstance();
-
-    if (targetType === "user" && isNonEmptyString(targetUserId)) {
-      await sharedCredManager.createSharedCredentialForUser(
-        hostAccessId,
-        effectiveCredentialId,
-        targetUserId,
-        ownerId,
-      );
-      return;
-    }
-
-    if (targetType === "role" && typeof targetRoleId === "number") {
-      await sharedCredManager.createSharedCredentialsForRole(
-        hostAccessId,
-        effectiveCredentialId,
-        targetRoleId,
-        ownerId,
-      );
-    }
-  } catch (error) {
-    databaseLogger.warn(
-      "Shared credential generation failed; keeping host share without credential copy",
-      {
-        operation: "rbac_share_shared_credential_best_effort_failed",
-        actingUserId,
-        hostId,
-        targetType,
-        targetUserId,
-        targetRoleId,
-        credentialId: effectiveCredentialId,
-        error:
-          error instanceof Error
-            ? `${error.name}: ${error.message}`
-            : "Unknown error",
-      },
-    );
-  }
-}
-
-async function getHostForOwnerOrAdmin(hostId: number, userId: string) {
-  const host = await db.select().from(hosts).where(eq(hosts.id, hostId)).limit(1);
-  if (host.length === 0) {
-    return { host: null, isAdmin: false, isOwner: false };
-  }
-
-  const isOwner = host[0].userId === userId;
-  const isAdmin = await permissionManager.isAdmin(userId);
-
-  return {
-    host: isOwner || isAdmin ? host[0] : null,
-    isAdmin,
-    isOwner,
-  };
-}
-
-async function getHostForShare(
-  hostId: number,
-  userId: string,
-): Promise<{
-  host: typeof hosts.$inferSelect | null;
-  isAdmin: boolean;
-  isOwner: boolean;
-}> {
-  const host = await db.select().from(hosts).where(eq(hosts.id, hostId)).limit(1);
-  if (host.length === 0) {
-    return { host: null, isAdmin: false, isOwner: false };
-  }
-
-  const isOwner = host[0].userId === userId;
-  const isAdmin = await permissionManager.isAdmin(userId);
-
-  if (isOwner || isAdmin) {
-    return {
-      host: host[0],
-      isAdmin,
-      isOwner,
-    };
-  }
-
-  const accessInfo = await permissionManager.canAccessHost(userId, hostId, "read");
-  if (accessInfo.hasAccess) {
-    return {
-      host: host[0],
-      isAdmin,
-      isOwner,
-    };
-  }
-
-  return {
-    host: null,
-    isAdmin,
-    isOwner,
-  };
 }
 
 /**
@@ -384,9 +112,13 @@ router.post(
           .json({ error: "Target role ID is required when sharing with role" });
       }
 
-      const { host, isAdmin, isOwner } = await getHostForShare(hostId, userId);
+      const host = await db
+        .select()
+        .from(hosts)
+        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
+        .limit(1);
 
-      if (!host) {
+      if (host.length === 0) {
         databaseLogger.warn("Permission denied", {
           operation: "rbac_permission_denied",
           userId,
@@ -397,10 +129,13 @@ router.post(
         return res.status(403).json({ error: "Not host owner" });
       }
 
-      const effectiveCredentialId = await ensureHostCredentialForSharing(
-        host,
-        userId,
-      );
+      if (!host[0].credentialId && host[0].authType !== "opkssh") {
+        return res.status(400).json({
+          error:
+            "Only hosts using credentials or OPKSSH can be shared. Please create a credential and assign it to this host before sharing.",
+          code: "CREDENTIAL_REQUIRED_FOR_SHARING",
+        });
+      }
 
       if (targetType === "user") {
         const targetUser = await db
@@ -469,23 +204,32 @@ router.post(
           .delete(sharedCredentials)
           .where(eq(sharedCredentials.hostAccessId, existing[0].id));
 
-        await createSharedCredentialBestEffort({
-          hostAccessId: existing[0].id,
-          effectiveCredentialId,
-          targetType,
-          targetUserId: targetType === "user" ? targetUserId : undefined,
-          targetRoleId: targetType === "role" ? targetRoleId : undefined,
-          ownerId: host.userId,
-          actingUserId: userId,
-          hostId,
-        });
+        if (host[0].credentialId) {
+          const { SharedCredentialManager } =
+            await import("../../utils/shared-credential-manager.js");
+          const sharedCredManager = SharedCredentialManager.getInstance();
+          if (targetType === "user") {
+            await sharedCredManager.createSharedCredentialForUser(
+              existing[0].id,
+              host[0].credentialId,
+              targetUserId!,
+              userId,
+            );
+          } else {
+            await sharedCredManager.createSharedCredentialsForRole(
+              existing[0].id,
+              host[0].credentialId,
+              targetRoleId!,
+              userId,
+            );
+          }
+        }
         databaseLogger.info("Permission granted", {
           operation: "rbac_permission_grant",
           adminId: userId,
           hostId,
           resource: "host",
           action: "view",
-          sharedByAdmin: isAdmin && !isOwner,
         });
 
         return res.json({
@@ -504,23 +248,33 @@ router.post(
         expiresAt,
       });
 
-      await createSharedCredentialBestEffort({
-        hostAccessId: result.lastInsertRowid as number,
-        effectiveCredentialId,
-        targetType,
-        targetUserId: targetType === "user" ? targetUserId : undefined,
-        targetRoleId: targetType === "role" ? targetRoleId : undefined,
-        ownerId: host.userId,
-        actingUserId: userId,
-        hostId,
-      });
+      const { SharedCredentialManager } =
+        await import("../../utils/shared-credential-manager.js");
+      const sharedCredManager = SharedCredentialManager.getInstance();
+
+      if (host[0].credentialId) {
+        if (targetType === "user") {
+          await sharedCredManager.createSharedCredentialForUser(
+            result.lastInsertRowid as number,
+            host[0].credentialId,
+            targetUserId!,
+            userId,
+          );
+        } else {
+          await sharedCredManager.createSharedCredentialsForRole(
+            result.lastInsertRowid as number,
+            host[0].credentialId,
+            targetRoleId!,
+            userId,
+          );
+        }
+      }
       databaseLogger.success("Host shared successfully", {
         operation: "rbac_host_share_success",
         userId,
         hostId,
         targetUserId: targetType === "user" ? targetUserId : undefined,
         permissionLevel,
-        sharedByAdmin: isAdmin && !isOwner,
       });
 
       res.json({
@@ -585,9 +339,13 @@ router.delete(
     }
 
     try {
-      const { host } = await getHostForOwnerOrAdmin(hostId, userId);
+      const host = await db
+        .select()
+        .from(hosts)
+        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
+        .limit(1);
 
-      if (!host) {
+      if (host.length === 0) {
         return res.status(403).json({ error: "Not host owner" });
       }
 
@@ -649,9 +407,13 @@ router.get(
     }
 
     try {
-      const { host } = await getHostForOwnerOrAdmin(hostId, userId);
+      const host = await db
+        .select()
+        .from(hosts)
+        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId)))
+        .limit(1);
 
-      if (!host) {
+      if (host.length === 0) {
         return res.status(403).json({ error: "Not host owner" });
       }
 
@@ -1184,6 +946,8 @@ router.post(
         .innerJoin(hosts, eq(hostAccess.hostId, hosts.id))
         .where(eq(hostAccess.roleId, roleId));
 
+      const { SharedCredentialManager } =
+        await import("../../utils/shared-credential-manager.js");
       const sharedCredManager = SharedCredentialManager.getInstance();
 
       for (const { host_access, ssh_data } of hostsSharedWithRole) {
@@ -1757,6 +1521,60 @@ router.get(
         userId,
       });
       res.status(500).json({ error: "Failed to get shared snippets" });
+    }
+  },
+);
+
+router.put(
+  "/host-access/:hostId/credential",
+  async (req: express.Request, res: express.Response) => {
+    try {
+      const userId = (req as AuthenticatedRequest).userId!;
+      const hostId = Number.parseInt(String(req.params.hostId), 10);
+      const { credentialId } = req.body;
+
+      if (!hostId || isNaN(hostId)) {
+        return res.status(400).json({ error: "Invalid host ID" });
+      }
+
+      const access = await db
+        .select()
+        .from(hostAccess)
+        .where(
+          and(eq(hostAccess.hostId, hostId), eq(hostAccess.userId, userId)),
+        )
+        .limit(1);
+
+      if (access.length === 0) {
+        return res.status(403).json({ error: "No access to this host" });
+      }
+
+      if (credentialId) {
+        const cred = await db
+          .select({ id: sshCredentials.id })
+          .from(sshCredentials)
+          .where(
+            and(
+              eq(sshCredentials.id, credentialId),
+              eq(sshCredentials.userId, userId),
+            ),
+          )
+          .limit(1);
+
+        if (cred.length === 0) {
+          return res.status(404).json({ error: "Credential not found" });
+        }
+      }
+
+      await db
+        .update(hostAccess)
+        .set({ overrideCredentialId: credentialId || null })
+        .where(eq(hostAccess.id, access[0].id));
+
+      res.json({ success: true });
+    } catch (error) {
+      databaseLogger.error("Failed to set override credential", error);
+      res.status(500).json({ error: "Failed to update credential" });
     }
   },
 );

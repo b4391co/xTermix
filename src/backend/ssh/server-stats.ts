@@ -1,6 +1,6 @@
 import express from "express";
-import compression from "compression";
 import net from "net";
+import { execFile } from "child_process";
 import { createCorsMiddleware } from "../utils/cors-config.js";
 import cookieParser from "cookie-parser";
 import { Client, type ConnectConfig } from "ssh2";
@@ -76,10 +76,7 @@ async function resolveJumpHost(
 ): Promise<JumpHostConfig | null> {
   try {
     const hostResults = await SimpleDBOps.select(
-      getDb()
-        .select()
-        .from(hosts)
-        .where(and(eq(hosts.id, hostId), eq(hosts.userId, userId))),
+      getDb().select().from(hosts).where(eq(hosts.id, hostId)),
       "ssh_data",
       userId,
     );
@@ -89,8 +86,37 @@ async function resolveJumpHost(
     }
 
     const host = hostResults[0];
+    const ownerId = (host.userId || userId) as string;
 
     if (host.credentialId) {
+      if (userId !== ownerId) {
+        try {
+          const { SharedCredentialManager } =
+            await import("../utils/shared-credential-manager.js");
+          const sharedCredManager = SharedCredentialManager.getInstance();
+          const sharedCred = await sharedCredManager.getSharedCredentialForUser(
+            hostId,
+            userId,
+          );
+          if (sharedCred) {
+            return {
+              ...host,
+              password: sharedCred.password,
+              key: sharedCred.key,
+              keyPassword: sharedCred.keyPassword,
+              keyType: sharedCred.keyType,
+              authType: sharedCred.key
+                ? "key"
+                : sharedCred.password
+                  ? "password"
+                  : "none",
+            } as JumpHostConfig;
+          }
+        } catch {
+          // fall through to owner credential lookup
+        }
+      }
+
       const credentials = await SimpleDBOps.select(
         getDb()
           .select()
@@ -98,11 +124,11 @@ async function resolveJumpHost(
           .where(
             and(
               eq(sshCredentials.id, host.credentialId as number),
-              eq(sshCredentials.userId, userId),
+              eq(sshCredentials.userId, ownerId),
             ),
           ),
         "ssh_credentials",
-        userId,
+        ownerId,
       );
 
       if (credentials.length > 0) {
@@ -110,7 +136,7 @@ async function resolveJumpHost(
         return {
           ...host,
           password: credential.password as string | undefined,
-          key: credential.privateKey as string | undefined,
+          key: (credential.key || credential.privateKey) as string | undefined,
           keyPassword: credential.keyPassword as string | undefined,
           keyType: credential.keyType as string | undefined,
           authType: credential.authType as string | undefined,
@@ -226,9 +252,47 @@ async function createJumpHostChain(
           host: jumpHostConfig.ip?.replace(/^\[|\]$/g, "") || jumpHostConfig.ip,
           port: jumpHostConfig.port || 22,
           username: jumpHostConfig.username,
-          tryKeyboard: true,
-          readyTimeout: 30000,
+          tryKeyboard: jumpHostConfig.authType !== "none",
+          readyTimeout: 60000,
           hostVerifier: jumpHostVerifier,
+          algorithms: {
+            kex: [
+              "curve25519-sha256",
+              "curve25519-sha256@libssh.org",
+              "ecdh-sha2-nistp521",
+              "ecdh-sha2-nistp384",
+              "ecdh-sha2-nistp256",
+              "diffie-hellman-group-exchange-sha256",
+              "diffie-hellman-group18-sha512",
+              "diffie-hellman-group17-sha512",
+              "diffie-hellman-group16-sha512",
+              "diffie-hellman-group15-sha512",
+              "diffie-hellman-group14-sha256",
+              "diffie-hellman-group14-sha1",
+              "diffie-hellman-group-exchange-sha1",
+              "diffie-hellman-group1-sha1",
+            ],
+            serverHostKey: [
+              "ssh-ed25519",
+              "ecdsa-sha2-nistp521",
+              "ecdsa-sha2-nistp384",
+              "ecdsa-sha2-nistp256",
+              "rsa-sha2-512",
+              "rsa-sha2-256",
+              "ssh-rsa",
+              "ssh-dss",
+            ],
+            cipher: SSH_ALGORITHMS.cipher,
+            hmac: [
+              "hmac-sha2-512-etm@openssh.com",
+              "hmac-sha2-256-etm@openssh.com",
+              "hmac-sha2-512",
+              "hmac-sha2-256",
+              "hmac-sha1",
+              "hmac-md5",
+            ],
+            compress: ["none", "zlib@openssh.com", "zlib"],
+          },
         };
 
         if (jumpHostConfig.authType === "password" && jumpHostConfig.password) {
@@ -243,6 +307,25 @@ async function createJumpHostChain(
             connectConfig.passphrase = jumpHostConfig.keyPassword;
           }
         }
+
+        jumpClient.on(
+          "keyboard-interactive",
+          (
+            _name: string,
+            _instructions: string,
+            _lang: string,
+            prompts: Array<{ prompt: string; echo: boolean }>,
+            finish: (responses: string[]) => void,
+          ) => {
+            const responses = prompts.map((p) => {
+              if (/password/i.test(p.prompt) && jumpHostConfig.password) {
+                return jumpHostConfig.password as string;
+              }
+              return "";
+            });
+            finish(responses);
+          },
+        );
 
         if (currentClient) {
           currentClient.forwardOut(
@@ -677,9 +760,20 @@ interface StatsConfig {
 }
 
 const DEFAULT_STATS_CONFIG: StatsConfig = {
-  enabledWidgets: ["cpu", "memory", "disk", "network", "uptime", "system"],
+  enabledWidgets: [
+    "cpu",
+    "memory",
+    "disk",
+    "network",
+    "uptime",
+    "system",
+    "login_stats",
+    "processes",
+    "ports",
+    "firewall",
+  ],
   statusCheckEnabled: true,
-  statusCheckInterval: 5,
+  statusCheckInterval: 60,
   metricsEnabled: true,
   metricsInterval: 30,
 };
@@ -845,7 +939,7 @@ class PollingManager {
     if (isTcpPingEnabled(statsConfig)) {
       const intervalMs = statsConfig.statusCheckInterval * 1000;
 
-      this.pollHostStatus(host, viewerUserId);
+      await this.pollHostStatus(host, viewerUserId);
 
       config.statusTimer = setInterval(() => {
         const latestConfig = this.pollingConfigs.get(host.id);
@@ -898,11 +992,9 @@ class PollingManager {
     }
 
     try {
-      const isOnline = await tcpPing(
-        refreshedHost.ip,
-        refreshedHost.port,
-        5000,
-      );
+      const isOnline =
+        (await icmpPing(refreshedHost.ip, 2500)) ||
+        (await tcpPing(refreshedHost.ip, refreshedHost.port, 5000));
       const statusEntry: StatusEntry = {
         status: isOnline ? "online" : "offline",
         lastChecked: new Date().toISOString(),
@@ -1040,9 +1132,9 @@ class PollingManager {
   async initializePolling(userId: string): Promise<void> {
     const hosts = await fetchAllHosts(userId);
 
-    for (const host of hosts) {
-      await this.startPollingForHost(host, { statusOnly: true });
-    }
+    await Promise.all(
+      hosts.map((host) => this.startPollingForHost(host, { statusOnly: true })),
+    );
   }
 
   async refreshHostPolling(userId: string): Promise<void> {
@@ -1060,9 +1152,9 @@ class PollingManager {
       }
     }
 
-    for (const host of hosts) {
-      await this.startPollingForHost(host, { statusOnly: true });
-    }
+    await Promise.all(
+      hosts.map((host) => this.startPollingForHost(host, { statusOnly: true })),
+    );
   }
 
   async refreshAllPolling(): Promise<void> {
@@ -1198,8 +1290,6 @@ function validateHostId(
 }
 
 const app = express();
-app.use(compression());
-app.set("trust proxy", true);
 app.use(createCorsMiddleware());
 app.use(cookieParser());
 app.use(express.json({ limit: "1mb" }));
@@ -1345,7 +1435,7 @@ async function resolveHostCredentials(
             baseHost.authType = sharedCred.authType;
 
             if (!host.overrideCredentialUsername) {
-              baseHost.username = sharedCred.username || host.username;
+              baseHost.username = sharedCred.username;
             }
 
             if (sharedCred.password) {
@@ -1459,8 +1549,8 @@ async function buildSshConfig(
     port: host.port,
     username: host.username,
     tryKeyboard: true,
-    keepaliveInterval: 30000,
-    keepaliveCountMax: 3,
+    keepaliveInterval: 60000,
+    keepaliveCountMax: 5,
     readyTimeout: 60000,
     tcpKeepAlive: true,
     tcpKeepAliveInitialDelay: 30000,
@@ -1970,10 +2060,12 @@ function tcpPing(
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let settled = false;
+    let dataTimeout: NodeJS.Timeout | null = null;
 
     const finish = (result: boolean) => {
       if (settled) return;
       settled = true;
+      if (dataTimeout) clearTimeout(dataTimeout);
       resolve(result);
     };
 
@@ -1988,8 +2080,26 @@ function tcpPing(
     socket.setTimeout(timeoutMs);
 
     socket.once("connect", () => {
-      cleanup();
-      finish(true);
+      dataTimeout = setTimeout(() => {
+        cleanup();
+        finish(true);
+      }, 2000);
+
+      socket.once("data", (data) => {
+        clearTimeout(dataTimeout);
+        const dataStr = data.toString("utf8");
+        if (dataStr.startsWith("SSH-")) {
+          try {
+            socket.end("SSH-2.0-TermixHealthCheck\r\n");
+          } catch {
+            // expected
+          }
+          setTimeout(cleanup, 200);
+        } else {
+          cleanup();
+        }
+        finish(true);
+      });
     });
 
     socket.once("timeout", () => {
@@ -2001,6 +2111,23 @@ function tcpPing(
       finish(false);
     });
     socket.connect(port, host);
+  });
+}
+
+function icmpPing(host: string, timeoutMs = 2500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const cleanHost = host.replace(/^\[|\]$/g, "");
+    const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+    const child = execFile(
+      "ping",
+      ["-c", "1", "-W", String(timeoutSeconds), cleanHost],
+      { timeout: timeoutMs + 500 },
+      (error) => {
+        resolve(!error);
+      },
+    );
+
+    child.on("error", () => resolve(false));
   });
 }
 
@@ -2417,19 +2544,6 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
           "Using existing metrics session",
         ),
       );
-      void pollingManager
-        .startPollingForHost(host, { viewerUserId: userId })
-        .catch((pollingError) => {
-          statsLogger.warn("Failed to resume polling on existing session", {
-            operation: "metrics_start_resume_polling",
-            hostId: host.id,
-            userId,
-            error:
-              pollingError instanceof Error
-                ? pollingError.message
-                : String(pollingError),
-          });
-        });
       return res.json({ success: true, connectionLogs });
     }
 
@@ -2564,23 +2678,6 @@ app.post("/metrics/start/:id", validateHostId, async (req, res) => {
             userId,
           };
           scheduleMetricsSessionCleanup(sessionKey);
-
-          void pollingManager
-            .startPollingForHost(host, { viewerUserId: userId })
-            .catch((pollingError) => {
-              statsLogger.error(
-                "Failed to start metrics polling after metrics session connect",
-                {
-                  operation: "metrics_start_polling",
-                  hostId: host.id,
-                  userId,
-                  error:
-                    pollingError instanceof Error
-                      ? pollingError.message
-                      : String(pollingError),
-                },
-              );
-            });
 
           const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
           pollingManager.registerViewer(host.id, viewerSessionId, userId);
@@ -3136,7 +3233,6 @@ app.post("/metrics/register-viewer", async (req, res) => {
     const viewerSessionId = `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     try {
       pollingManager.registerViewer(hostId, viewerSessionId, userId);
-      await pollingManager.startPollingForHost(host, { viewerUserId: userId });
     } catch (regErr) {
       statsLogger.warn(
         "pollingManager.registerViewer threw (treating as no-op)",
@@ -3407,7 +3503,7 @@ process.on("SIGTERM", () => {
 });
 
 const PORT = 30005;
-const server = app.listen(PORT, async () => {
+app.listen(PORT, async () => {
   try {
     await authManager.initialize();
   } catch (err) {
@@ -3424,9 +3520,3 @@ const server = app.listen(PORT, async () => {
     10 * 60 * 1000,
   );
 });
-
-server.timeout = 60000;
-server.keepAliveTimeout = 30000;
-server.headersTimeout = 30000;
-server.maxConnections = 500;
-server.requestTimeout = 60000;

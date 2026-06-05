@@ -6,7 +6,12 @@
     "output": "release"
   },
   "asar": true,
-  "asarUnpack": ["dist/backend/**/*", "node_modules/**/*"],
+  "asarUnpack": [
+    "dist/backend/**/*",
+    "node_modules/**/*",
+    "public/icons/**/*",
+    "public/icon.*"
+  ],
   "files": [
     "dist/**/*",
     "electron/**/*",
@@ -30,7 +35,8 @@
     "!public/icons/**/*"
   ],
   "extraMetadata": {
-    "main": "electron/main.cjs"
+    "main": "electron/main.cjs",
+    "type": "commonjs"
   },
   "buildDependenciesFromSource": false,
   "nodeGypRebuild": false,
@@ -84,8 +90,8 @@
     "desktop": {
       "entry": {
         "Name": "Termix",
-        "Comment": "A web-based server management platform",
-        "Keywords": "terminal;ssh;server;management;",
+        "Comment": "Self-hosted SSH and remote desktop management. ",
+        "Keywords": "docker;ssh;terminal;telnet;self-hosted;rdp;file-management;vnc;ssh-tunnel;server-stats;termix",
         "StartupWMClass": "termix"
       }
     }

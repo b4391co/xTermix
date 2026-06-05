@@ -38,6 +38,15 @@ app.use((_req, res, next) => {
   next();
 });
 
+// Compatibility for reverse proxies that preserve the frontend /api prefix.
+// The tunnel service owns /ssh/* routes, so /api/ssh/* must be normalized here.
+app.use((req, _res, next) => {
+  if (req.url.startsWith("/api/ssh/")) {
+    req.url = req.url.replace(/^\/api\/ssh/, "/ssh");
+  }
+  next();
+});
+
 const authManager = AuthManager.getInstance();
 const permissionManager = PermissionManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
@@ -943,8 +952,8 @@ async function connectEndpointThroughSource(
     sock: endpointSock,
     username: tunnelConfig.endpointUsername,
     tryKeyboard: true,
-    keepaliveInterval: 30000,
-    keepaliveCountMax: 3,
+    keepaliveInterval: tunnelConfig.keepaliveInterval ?? 60000,
+    keepaliveCountMax: tunnelConfig.keepaliveCountMax ?? 5,
     readyTimeout: 60000,
     tcpKeepAlive: true,
     tcpKeepAliveInitialDelay: 30000,
@@ -1150,6 +1159,14 @@ async function resolveC2STunnelSource(
     socks5Username: resolvedHost.socks5Username,
     socks5Password: resolvedHost.socks5Password,
     socks5ProxyChain: resolvedHost.socks5ProxyChain,
+    keepaliveInterval:
+      typeof resolvedHost.terminalConfig?.keepaliveInterval === "number"
+        ? resolvedHost.terminalConfig.keepaliveInterval * 1000
+        : 60000,
+    keepaliveCountMax:
+      typeof resolvedHost.terminalConfig?.keepaliveCountMax === "number"
+        ? resolvedHost.terminalConfig.keepaliveCountMax
+        : 5,
   };
 }
 
@@ -1162,8 +1179,8 @@ async function connectC2SSourceClient(
     port: tunnelConfig.sourceSSHPort,
     username: tunnelConfig.sourceUsername,
     tryKeyboard: true,
-    keepaliveInterval: 30000,
-    keepaliveCountMax: 3,
+    keepaliveInterval: tunnelConfig.keepaliveInterval ?? 60000,
+    keepaliveCountMax: tunnelConfig.keepaliveCountMax ?? 5,
     readyTimeout: 60000,
     tcpKeepAlive: true,
     tcpKeepAliveInitialDelay: 30000,
@@ -1609,6 +1626,18 @@ async function connectSSHTunnel(
           keyType: resolvedHost.keyType,
           authMethod: resolvedHost.authType,
         };
+        if (tunnelConfig.keepaliveInterval === undefined) {
+          tunnelConfig.keepaliveInterval =
+            typeof resolvedHost.terminalConfig?.keepaliveInterval === "number"
+              ? resolvedHost.terminalConfig.keepaliveInterval * 1000
+              : 60000;
+        }
+        if (tunnelConfig.keepaliveCountMax === undefined) {
+          tunnelConfig.keepaliveCountMax =
+            typeof resolvedHost.terminalConfig?.keepaliveCountMax === "number"
+              ? resolvedHost.terminalConfig.keepaliveCountMax
+              : 5;
+        }
       }
     } catch (error) {
       tunnelLogger.warn("Failed to resolve source host credentials", {
@@ -1674,7 +1703,9 @@ async function connectSSHTunnel(
           const credential = credentials[0];
           resolvedEndpointCredentials = {
             password: credential.password as string | undefined,
-            sshKey: credential.privateKey as string | undefined,
+            sshKey: (credential.key || credential.privateKey) as
+              | string
+              | undefined,
             keyPassword: credential.keyPassword as string | undefined,
             keyType: credential.keyType as string | undefined,
             authMethod: credential.authType as string,
@@ -1934,8 +1965,8 @@ async function connectSSHTunnel(
     port: tunnelConfig.sourceSSHPort,
     username: tunnelConfig.sourceUsername,
     tryKeyboard: true,
-    keepaliveInterval: 30000,
-    keepaliveCountMax: 3,
+    keepaliveInterval: tunnelConfig.keepaliveInterval ?? 60000,
+    keepaliveCountMax: tunnelConfig.keepaliveCountMax ?? 5,
     readyTimeout: 60000,
     tcpKeepAlive: true,
     tcpKeepAliveInitialDelay: 30000,
@@ -2190,11 +2221,11 @@ async function killRemoteTunnelByMarker(
         tunnelConfig.sourceIP?.replace(/^\[|\]$/g, "") || tunnelConfig.sourceIP,
       port: tunnelConfig.sourceSSHPort,
       username: tunnelConfig.sourceUsername,
-      keepaliveInterval: 30000,
-      keepaliveCountMax: 3,
+      keepaliveInterval: tunnelConfig.keepaliveInterval ?? 60000,
+      keepaliveCountMax: tunnelConfig.keepaliveCountMax ?? 5,
       readyTimeout: 60000,
       tcpKeepAlive: true,
-      tcpKeepAliveInitialDelay: 15000,
+      tcpKeepAliveInitialDelay: 30000,
       algorithms: {
         kex: [
           "diffie-hellman-group14-sha256",
@@ -2695,9 +2726,22 @@ app.post(
 
       res.json({ message: "Connection request received", tunnelName });
 
-      operation.finally(() => {
-        pendingTunnelOperations.delete(tunnelName);
-      });
+      operation
+        .catch((err) => {
+          tunnelLogger.error("Tunnel operation failed", err, {
+            operation: "tunnel_operation_failed",
+            tunnelName,
+          });
+          broadcastTunnelStatus(tunnelName, {
+            connected: false,
+            status: CONNECTION_STATES.FAILED,
+            reason: err instanceof Error ? err.message : "Unknown error",
+          });
+          tunnelConnecting.delete(tunnelName);
+        })
+        .finally(() => {
+          pendingTunnelOperations.delete(tunnelName);
+        });
     } catch (error) {
       tunnelLogger.error("Failed to process tunnel connect", error, {
         operation: "tunnel_connect",
