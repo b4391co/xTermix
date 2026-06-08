@@ -129,11 +129,14 @@ export const hosts = sqliteTable("ssh_data", {
   terminalConfig: text("terminal_config"),
   quickActions: text("quick_actions"),
   notes: text("notes"),
+
+  // Per-protocol flags allow a saved host to expose SSH, RDP, VNC, and/or Telnet independently.
   enableSsh: integer("enable_ssh", { mode: "boolean" }).notNull().default(true),
   enableRdp: integer("enable_rdp", { mode: "boolean" }).notNull().default(false),
   enableVnc: integer("enable_vnc", { mode: "boolean" }).notNull().default(false),
   enableTelnet: integer("enable_telnet", { mode: "boolean" }).notNull().default(false),
 
+  // Protocol-specific ports and credentials keep non-SSH connection settings separate from legacy SSH fields.
   sshPort: integer("ssh_port").default(22),
   rdpPort: integer("rdp_port").default(3389),
   vncPort: integer("vnc_port").default(5900),
@@ -274,6 +277,7 @@ export const sshCredentials = sqliteTable("ssh_credentials", {
   keyType: text("key_type"),
   detectedKeyType: text("detected_key_type"),
 
+  // Public user certificate paired with the credential key for certificate-based SSH auth.
   certPublicKey: text("cert_public_key", { length: 8192 }),
 
   systemPassword: text("system_password"),
@@ -322,6 +326,7 @@ export const snippets = sqliteTable("snippets", {
   updatedAt: text("updated_at")
     .notNull()
     .default(sql`CURRENT_TIMESTAMP`),
+  // Optional host selector used to show snippets only where they apply.
   hostFilter: text("host_filter"),
 });
 
@@ -482,6 +487,7 @@ export const hostAccess = sqliteTable("host_access", {
     .default(sql`CURRENT_TIMESTAMP`),
   lastAccessedAt: text("last_accessed_at"),
   accessCount: integer("access_count").notNull().default(0),
+  // Lets a shared access grant use a credential different from the host default.
   overrideCredentialId: integer("override_credential_id").references(
     () => sshCredentials.id,
     { onDelete: "set null" },
@@ -651,6 +657,7 @@ export const apiKeys = sqliteTable("api_keys", {
   isActive: integer("is_active", { mode: "boolean" }).notNull().default(true),
 });
 
+// Stores restorable workspace tabs per user. Rows are cleared on backend startup to avoid stale sessions.
 export const userOpenTabs = sqliteTable("user_open_tabs", {
   id: text("id").primaryKey(),
   userId: text("user_id")

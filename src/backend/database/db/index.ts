@@ -463,6 +463,7 @@ async function initializeCompleteDatabase(): Promise<void> {
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     );
 
+    -- Keeps the last tab list per user so a client can optionally restore the workspace after login.
     CREATE TABLE IF NOT EXISTS user_open_tabs (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -490,6 +491,8 @@ async function initializeCompleteDatabase(): Promise<void> {
 
 `);
 
+  // Open tab rows describe browser UI state. Clear them on backend startup so stale
+  // sessions do not reopen terminals after a process restart.
   try {
     sqlite.prepare("DELETE FROM user_open_tabs").run();
     databaseLogger.info("Open tabs cleared on startup", {
@@ -766,6 +769,8 @@ const migrateSchema = () => {
   addColumnIfNotExists("ssh_credentials", "public_key", "TEXT");
   addColumnIfNotExists("ssh_credentials", "detected_key_type", "TEXT");
 
+  // Stores the public side of a user certificate separately from the private key
+  // so certificate-based SSH credentials can be displayed and validated safely.
   addColumnIfNotExists("ssh_credentials", "cert_public_key", "TEXT");
 
   addColumnIfNotExists("ssh_credentials", "system_password", "TEXT");
@@ -840,6 +845,7 @@ const migrateSchema = () => {
 
   addColumnIfNotExists("snippets", "folder", "TEXT");
   addColumnIfNotExists("snippets", "order", "INTEGER NOT NULL DEFAULT 0");
+  // Optional host filter limits when a snippet is shown or suggested.
   addColumnIfNotExists("snippets", "host_filter", "TEXT");
 
   try {
@@ -1066,6 +1072,8 @@ const migrateSchema = () => {
     }
   }
 
+  // Allows a shared host access grant to point at a specific credential instead
+  // of always using the host default credential.
   try {
     sqlite.prepare("SELECT override_credential_id FROM host_access LIMIT 1").get();
   } catch {
@@ -1092,6 +1100,8 @@ const migrateSchema = () => {
     }
   }
 
+  // Per-protocol enable flags, ports, and credential fields let one host expose
+  // SSH, RDP, VNC, and Telnet settings independently while preserving existing rows.
   const sshDataMigrations: Array<{ column: string; sql: string }> = [
     { column: "connection_type", sql: "ALTER TABLE ssh_data ADD COLUMN connection_type TEXT NOT NULL DEFAULT 'ssh'" },
     { column: "credential_id", sql: "ALTER TABLE ssh_data ADD COLUMN credential_id INTEGER" },
@@ -1150,8 +1160,9 @@ const migrateSchema = () => {
     }
   }
 
-  // Copy unencrypted username/domain into protocol-specific columns for old guac hosts.
-  // Passwords are handled via the legacy field name fallback in lazy-field-encryption.ts.
+  // Backfill protocol-specific credential columns for existing Guacamole hosts.
+  // Password values are copied only into the matching protocol field; legacy
+  // encrypted-field fallback in lazy-field-encryption.ts still handles old names.
   const usernameDomainBackfills = [
     {
       protocol: "rdp",
